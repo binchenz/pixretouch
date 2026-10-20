@@ -215,6 +215,24 @@ def test_no_adjustment_and_validation_errors(isolated_home, photo, tmp_path):
     assert [h["capability"] for h in data.history(conn, img_id)] == ["base"]
 
 
+def test_bw_classic_asset_matches_generator(tmp_path):
+    """再生一致性（lead 批复 3）：生成器输出与已提交资产逐字节比对。
+
+    防止将来改了配方常数/生成逻辑却忘记再生 luts/bw-classic.cube 资产。
+    """
+    from pixretouch.capabilities.color import (
+        BW_CLASSIC_NAME,
+        LUT_DIR,
+        generate_bw_classic_cube,
+    )
+
+    committed = (LUT_DIR / f"{BW_CLASSIC_NAME}.cube").read_bytes()
+    regen = tmp_path / "regen.cube"
+    generate_bw_classic_cube(regen)
+    assert regen.read_bytes() == committed, \
+        "bw-classic.cube 资产与生成器不一致——请运行 generate_bw_classic_cube 再生并提交"
+
+
 def test_original_readonly_and_rollback(isolated_home, photo):
     from pixretouch import data, server
 
