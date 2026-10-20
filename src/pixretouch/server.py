@@ -4,7 +4,8 @@ stdio 传输；stdout 是协议信道，任何日志只走 stderr。
 基于 mcp 2.x：from mcp.server import MCPServer（v1 的 mcp.server.fastmcp 已移除）。
 工具随能力工单逐个挂载：doctor（工单01）、blemish_remove（工单03）、
 assess_image / detect_faces / selection_report（工单04）、
-cutout / bg_replace / bg_blur（工单08）、color_grade（工单09）。
+cutout / bg_replace / bg_blur（工单08）、color_grade（工单09）、
+super_resolve（工单10）。
 挂载模式（后续能力照抄）：from .capabilities import <name> 触发注册副作用，
 @mcp.tool() 只做薄包装，逻辑全部在能力模块的 <tool>_op() 里。
 """
@@ -22,6 +23,7 @@ from .capabilities import background as background_cap  # 逻辑主体（工单 
 from .capabilities import color as color_cap  # 逻辑主体（工单 09：调色）
 from .capabilities import cutout as cutout_cap  # 逻辑主体（工单 08：主体抠图）
 from .capabilities import inpaint as inpaint_cap  # noqa: F401  能力注册副作用（工单 03）
+from .capabilities import superres as superres_cap  # 逻辑主体（工单 10：超分增强）
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("pixretouch.server")
@@ -202,6 +204,23 @@ def color_grade(
         image_id, temperature=temperature, tint=tint, wb_auto=wb_auto,
         exposure=exposure, contrast=contrast, lut=lut, lut_path=lut_path,
     )
+
+
+@mcp.tool()
+def super_resolve(image_id: int, scale: int = 4) -> dict[str, Any]:
+    """超分增强（Real-ESRGAN）：×2/×4 放大，大图自动分块防 OOM、块缝不可见；追加记录链，可回滚。
+
+    Args:
+        image_id: 库内图像 ID（ingest 返回）。
+        scale: 放大倍率，2 或 4（原生双模型）。
+        RGBA 链态：RGB 走模型、alpha 以 lanczos 同步放大（纪律 8 几何增补）。
+
+    Returns:
+        成功 {status:"ok", record_id, output_sha256, output_path, cache_hit, width, height}；
+        失败 {status:"error", error}（结构化错误，不抛穿）。
+        守卫：输出边长 >65500（JPEG 上限）或画布 >8GB → 结构化拒绝。
+    """
+    return superres_cap.super_resolve_op(image_id, scale=scale)
 
 
 def main() -> None:
