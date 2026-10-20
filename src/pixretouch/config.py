@@ -10,7 +10,8 @@ import os
 from pathlib import Path
 
 PKG_ROOT = Path(__file__).resolve().parent                    # src/pixretouch
-PROJECT_HOME = Path(os.environ.get("PIXRETOUCH_HOME", PKG_ROOT.parents[2]))
+# editable 安装下 parents[1] = 仓库根（pixretouch/）；可用 PIXRETOUCH_HOME 覆盖
+PROJECT_HOME = Path(os.environ.get("PIXRETOUCH_HOME", PKG_ROOT.parents[1]))
 
 VAR_DIR = PROJECT_HOME / "var"
 DB_PATH = VAR_DIR / "pixretouch.db"
