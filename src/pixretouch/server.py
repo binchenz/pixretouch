@@ -4,7 +4,7 @@ stdio 传输；stdout 是协议信道，任何日志只走 stderr。
 基于 mcp 2.x：from mcp.server import MCPServer（v1 的 mcp.server.fastmcp 已移除）。
 工具随能力工单逐个挂载：doctor（工单01）、blemish_remove（工单03）、
 assess_image / detect_faces / selection_report（工单04）、
-cutout / bg_replace / bg_blur（工单08）。
+cutout / bg_replace / bg_blur（工单08）、color_grade（工单09）。
 挂载模式（后续能力照抄）：from .capabilities import <name> 触发注册副作用，
 @mcp.tool() 只做薄包装，逻辑全部在能力模块的 <tool>_op() 里。
 """
@@ -19,6 +19,7 @@ from mcp.server import MCPServer  # mcp 2.x API（v1 的 mcp.server.fastmcp 已�
 from . import doctor as doctor_mod
 from .capabilities import assess as assess_cap  # 逻辑主体（工单 04：选片质检）
 from .capabilities import background as background_cap  # 逻辑主体（工单 08：背景替换/虚化）
+from .capabilities import color as color_cap  # 逻辑主体（工单 09：调色）
 from .capabilities import cutout as cutout_cap  # 逻辑主体（工单 08：主体抠图）
 from .capabilities import inpaint as inpaint_cap  # noqa: F401  能力注册副作用（工单 03）
 
@@ -167,6 +168,40 @@ def bg_blur(
         失败 {status:"error", error}。
     """
     return background_cap.bg_blur_op(image_id, strength=strength, max_blur=max_blur, focus=focus)
+
+
+@mcp.tool()
+def color_grade(
+    image_id: int,
+    temperature: int = 0,
+    tint: int = 0,
+    wb_auto: bool = False,
+    exposure: float = 0.0,
+    contrast: int = 0,
+    lut: str | None = None,
+    lut_path: str | None = None,
+) -> dict[str, Any]:
+    """调色：白平衡 / 影调 / cube 3D LUT 三组参数可独立或组合为一次调用；追加记录链，可回滚。
+
+    Args:
+        image_id: 库内图像 ID。RGBA 链态只调 RGB 通道，alpha 直通。
+        temperature: 白平衡色温 -100..100（+暖 −冷）。
+        tint: 白平衡色调 -100..100（+品红 −绿）。
+        wb_auto: 灰世界自动白平衡。
+        exposure: 曝光档数 -2.0..2.0 EV。
+        contrast: 对比 -100..100（软 S 曲线，端点不动）。
+        lut: 内置 LUT 名（一期：'bw-classic' 经典黑白基准配方）。
+        lut_path: 外部 .cube 文件路径（与 lut 二选一；内容 sha256 自动进缓存键）。
+        至少需要一项调整。
+
+    Returns:
+        成功 {status:"ok", record_id, output_sha256, output_path, cache_hit}；
+        失败 {status:"error", error}（结构化错误，不抛穿）。
+    """
+    return color_cap.color_grade_op(
+        image_id, temperature=temperature, tint=tint, wb_auto=wb_auto,
+        exposure=exposure, contrast=contrast, lut=lut, lut_path=lut_path,
+    )
 
 
 def main() -> None:

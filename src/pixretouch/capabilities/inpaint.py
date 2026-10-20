@@ -45,9 +45,29 @@
    b) 不回滚的连续同参 apply 必然 miss（当前输出哈希已变）——不是 bug，测试别写反；
    c) 同参换 mask 必 miss 且 cache_index 行数 +1 —— 可作 mask 语义的正向断言。
 5. tests/test_capability_<name>.py：走工具函数入口（主接缝）；tmp_path 隔离库与缓存、
-   MODELS_DIR 指向仓库 models/（权重跨测试共享）；权重缺失 skipif；属性式断言
+   MODELS_DIR 指向仓库 models/（无线程复用问题）；权重缺失 skipif；属性式断言
    （尺寸一致/目标区域变化/非目标区域近似不变/记录链+1/回滚恢复/缓存命中），
    不绑定模型输出字节。
+
+== 纪律补充（lead 裁决 2026-10-21，全能力单适用）==
+6. 执行环境确定性（缓存审计的结构性前提）：推理后端锁定**单一执行环境**——
+   ORT 一律 CPUExecutionProvider（CoreML 等异构 EP 数值漂移会破坏「同键同字节」）；
+   torch 设备在首次加载时定死并常驻（进程内不漂移）。实证：LaMa MPS 绕过缓存
+   三连真实渲染字节一致，CPU 对照一致，且 MPS↔CPU 在 256² fixture 舍入量化后
+   位同（舍入吸收了设备间微小数值差）→ 审计口径「同键⇒同字节、以首渲字节为准」成立。
+7. 外部素材规则：任何外部输入文件（背景图/.cube LUT 等）以其**内容 sha256** 记入
+   params 并参与缓存键，**路径不进键**；素材内容以 cache.put("material:"+sha) 固化进
+   内容寻址存储，渲染函数经 ctx.cache.path_for(sha) 按 sha 取回——payload 只作省算
+   快路径，不得成为唯一取用途径（保证「仅凭 params 可重建」）。
+8. RGBA 链态策略（全域统一，与 dev-b 人像域对齐）：链处于 RGBA 态（cutout 产物）时，
+   像素类能力**只处理 RGB 通道、alpha 原样直通**，产物保持 RGBA（PNG 无损）；
+   仅合成类操作（bg_replace）消费 alpha 并输出 RGB。禁止隐式平整（丢 alpha）破坏链可组合性。
+9. 模型句柄生命周期（审计留档 2026-10-21）：本项目所有模型句柄 = **模块级常驻单例 +
+   双检锁**（inpaint._MODEL / cutout._ORT_SESSIONS），无线程本地副本、无每调用新建、
+   推理不在加载锁内；ORT Run() 官方线程安全，torch forward 在 inference_mode+GIL 下
+   多线程共用单实例。对照 dev-b mediapipe 序列死锁（嫌疑=每调用新建句柄/跨线程复用）：
+   本模式无此风险面；若未来出现并发异常，降级方案=模块级推理串行锁。两域纪律待
+   dev-b 根因实证后对齐成同一套。
 """
 from __future__ import annotations
 
@@ -246,11 +266,17 @@ def render(image: Path, params: dict, ctx: EngineContext) -> Path:
     from PIL import Image
 
     with Image.open(image) as im:
+        alpha = im.getchannel("A") if im.mode == "RGBA" else None  # RGBA 链态：alpha 直通（纪律 8）
         rgb = im.convert("RGB")
     mask = ctx.payload.get("mask") or build_mask(rgb.size, params)
     out_img = lama_inpaint(rgb, mask)
-    out = ctx.scratch_file("blemish", ".jpg")
-    out_img.save(out, "JPEG", quality=95, subsampling=0)
+    if alpha is not None:
+        out_img.putalpha(alpha)
+        out = ctx.scratch_file("blemish", ".png")
+        out_img.save(out, "PNG")  # RGBA 态保持无损，链可组合
+    else:
+        out = ctx.scratch_file("blemish", ".jpg")
+        out_img.save(out, "JPEG", quality=95, subsampling=0)
     return out
 
 

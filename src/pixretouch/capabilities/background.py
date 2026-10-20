@@ -10,9 +10,12 @@ bg_blur：Depth-Anything-V2（small，ONNX）深度驱动的自然虚化——�
 mask 通道双登记规则（与 cutout.py 一致）：params 可确定性派生的 mask 仅记 sha；
 模型派生的 mask（alpha/深度权重图）另以 cache.put("mask:"+sha) 固化内容寻址文件。
 
-外部文件引用的缓存键规则：background_path 这类外部素材，其**内容 sha256 记入
-params**（bg_sha256）参与缓存键——路径不变内容变 ⇒ 键变，不会假命中；渲染函数
-仅凭 params（重读该路径）即可重建，符合确定性纪律。
+外部素材规则（lead 裁决 2026-10-21，模式 docstring 纪律 7）：背景图等外部素材以其
+**内容 sha256** 记入 params（bg_sha256）参与缓存键，**路径不进键**；素材内容以
+cache.put("material:"+sha) 固化进内容寻址存储，渲染经 ctx.cache.path_for(sha) 按 sha
+取回（payload 仅省算）——内容变 ⇒ 键变不假命中；同内容换路径 ⇒ 键不变必命中。
+RGBA 链态（纪律 8）：bg_blur 只处理 RGB、alpha 直通、产物保持 RGBA（PNG 无损）；
+bg_replace 是合成类操作——消费 alpha 输出 RGB 属其语义本身，不算平整破坏。
 
 权重源选型（2026-10-21 curl 勘察）：
 - onnx-community/depth-anything-v2-small「onnx/model.onnx」：apache-2.0，
@@ -87,7 +90,13 @@ def _bg_array(params: dict, size: tuple[int, int], ctx: EngineContext | None) ->
     w, h = size
     if params["mode"] == "color":
         return np.full((h, w, 3), params["color"], dtype=np.float32)
-    with Image.open(params["background_path"]) as im:
+    # 正规取用路径：内容寻址存储（op 阶段已固化 material:<sha>）；params 只含 sha 不含路径
+    if ctx is None or ctx.cache is None:
+        raise FileNotFoundError("背景素材取用需 ctx.cache（素材规则，模式 docstring 纪律 7）")
+    mat = ctx.cache.path_for(params["bg_sha256"])
+    if not mat.exists():
+        raise FileNotFoundError(f"背景素材未在内容寻址存储中：{params['bg_sha256']}")
+    with Image.open(mat) as im:
         bg = _cover_fit(im.convert("RGB"), (w, h))
     return np.asarray(bg, dtype=np.float32)
 
@@ -97,8 +106,7 @@ def _bg_array(params: dict, size: tuple[int, int], ctx: EngineContext | None) ->
     params_schema={
         "mode": "'color' 纯色 | 'image' 指定背景图",
         "color": "[r,g,b] 0..255（mode=color）",
-        "background_path": "背景图路径（mode=image）",
-        "bg_sha256": "背景图内容 sha256（mode=image，自动填充，参与缓存键）",
+        "bg_sha256": "背景图内容 sha256（mode=image，自动填充，参与缓存键；路径不进键）",
         "fit": "背景图适配方式，一期仅 'cover'",
         "feather": "边缘羽化半径（像素）0..10，默认 2",
         "despill": "溢色处理开关，默认 true",
@@ -163,6 +171,7 @@ def render_bg_blur(image: Path, params: dict, ctx: EngineContext) -> Path:
     from PIL import Image
 
     with Image.open(image) as im:
+        alpha_ch = im.getchannel("A") if im.mode == "RGBA" else None  # 纪律 8：alpha 直通
         rgb = im.convert("RGB")
     t = ctx.payload.get("t")
     if t is None:  # 纪律：仅凭 params 可重建
@@ -180,8 +189,14 @@ def render_bg_blur(image: Path, params: dict, ctx: EngineContext) -> Path:
         w_i = np.clip(tn - (i - 1), 0.0, 1.0)[..., None]
         base = base * (1.0 - w_i) + lvl * w_i
     out = np.clip(base, 0, 255).round().astype(np.uint8)
-    dst = ctx.scratch_file("bg_blur", ".jpg")
-    Image.fromarray(out).save(dst, "JPEG", quality=95, subsampling=0)
+    img_out = Image.fromarray(out)
+    if alpha_ch is not None:
+        img_out.putalpha(alpha_ch)
+        dst = ctx.scratch_file("bg_blur", ".png")
+        img_out.save(dst, "PNG")  # RGBA 态保持无损
+    else:
+        dst = ctx.scratch_file("bg_blur", ".jpg")
+        img_out.save(dst, "JPEG", quality=95, subsampling=0)
     return dst
 
 
@@ -209,22 +224,23 @@ def _validate_replace(color: Any, background_path: Any, feather: Any, despill: A
     bool(despill)
 
 
-def _normalize_replace(image_size_ok: bool, color: Any, background_path: Any,
-                       feather: Any, despill: Any) -> dict[str, Any]:
+def _normalize_replace(color: Any, background_path: Any, feather: Any,
+                       despill: Any) -> tuple[dict[str, Any], "Path | None"]:
+    """规范化 → (params, 背景图解析路径或 None)。params 只含内容 sha 不含路径（素材规则）。"""
     params: dict[str, Any] = {"feather": round(float(feather), 3), "despill": bool(despill)}
     if color is not None:
         params.update({"mode": "color", "color": [int(c) for c in color]})
-    else:
-        p = Path(background_path).expanduser()
-        if not p.is_absolute():
-            p = config.PROJECT_HOME / p
-        if not p.exists():
-            raise ValueError(f"背景图不存在：{p}")
-        params.update({
-            "mode": "image", "background_path": str(p), "fit": "cover",
-            "bg_sha256": data.file_sha256(p),  # 内容 sha 进缓存键：内容变⇒键变，不会假命中
-        })
-    return params
+        return params, None
+    p = Path(background_path).expanduser()
+    if not p.is_absolute():
+        p = config.PROJECT_HOME / p
+    if not p.exists():
+        raise ValueError(f"背景图不存在：{p}")
+    params.update({
+        "mode": "image", "fit": "cover",
+        "bg_sha256": data.file_sha256(p),  # 内容 sha 进缓存键；路径不进键（lead 裁决）
+    })
+    return params, p
 
 
 def bg_replace_op(image_id: int, color: list | None = None, background_path: str | None = None,
@@ -238,7 +254,9 @@ def bg_replace_op(image_id: int, color: list | None = None, background_path: str
     try:
         cur = data.get_current(conn, image_id)
         _validate_replace(color, background_path, feather, despill)
-        params = _normalize_replace(True, color, background_path, feather, despill)
+        params, bg_src = _normalize_replace(color, background_path, feather, despill)
+        if bg_src is not None:
+            cache.put(f"material:{params['bg_sha256']}", bg_src)  # 素材固化进内容寻址存储
 
         with Image.open(cur["output_path"]) as im:
             embedded = im.getchannel("A") if im.mode == "RGBA" else None
@@ -257,9 +275,10 @@ def bg_replace_op(image_id: int, color: list | None = None, background_path: str
         m_sha = png_sha256(a_img)
 
         ctx = get_context()
+        ctx.cache = cache  # 素材正规取用入口：path_for(bg_sha256)
         ctx.payload["alpha"] = alpha
         if params["mode"] == "image":
-            with Image.open(params["background_path"]) as im:
+            with Image.open(bg_src) as im:
                 ctx.payload["bg"] = np.asarray(_cover_fit(im.convert("RGB"), size), dtype=np.float32)
         else:
             ctx.payload["bg"] = np.full((size[1], size[0], 3), params["color"], dtype=np.float32)

@@ -61,12 +61,16 @@ class EngineContext:
 
     scratch: 临时产物目录（工具层在 data.apply 后负责清理临时文件，缓存中已有固化副本）。
     payload: 工具层预构建的对象（如 mask），避免渲染函数重复计算。
+    cache: ContentCache 引用（工具层赋值）——外部素材的**正规取用入口**：
+        ctx.cache.path_for(素材内容 sha)。素材类 payload 只是省算快路径，
+        渲染函数必须能仅凭 params 的内容 sha 经 cache 重建（lead 裁决 2026-10-21）。
     纪律：payload 不得影响输出确定性——仅凭 params 重建必须得到一致结果
     （缓存键只含 输入哈希/能力/params/mask_sha，见 ADR-0002）。
     """
 
     scratch: Path
     payload: dict[str, Any] = field(default_factory=dict)
+    cache: Any = None
 
     def scratch_file(self, prefix: str, suffix: str) -> Path:
         self.scratch.mkdir(parents=True, exist_ok=True)

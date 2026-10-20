@@ -168,7 +168,14 @@ def test_bg_replace_image_bg_content_sha_in_key(isolated_home, photo, tmp_path):
     assert r1["status"] == "ok", r1
     assert np.abs(_px(Path(r1["output_path"]))[5, 5] - np.array([220, 30, 30])).max() <= 8
 
-    # 同路径换内容（纯绿）→ bg_sha256 变 → 缓存键变 → 必 miss（外部文件内容进键的证据）
+    # 同内容异路径 → 路径不进键（素材规则，lead 裁决）→ 必命中
+    data.rollback_to(conn, img_id, ing["record_id"])
+    bg2 = tmp_path / "bg-copy.png"
+    bg2.write_bytes(bg.read_bytes())
+    r_same = server.bg_replace(img_id, background_path=str(bg2))
+    assert r_same["cache_hit"] is True and r_same["output_sha256"] == r1["output_sha256"]
+
+    # 同路径换内容（纯绿）→ bg_sha256 变 → 缓存键变 → 必 miss（内容 sha 进键的证据）
     data.rollback_to(conn, img_id, ing["record_id"])
     Image.new("RGB", (64, 64), (30, 200, 60)).save(bg, "PNG")
     r2 = server.bg_replace(img_id, background_path=str(bg))
