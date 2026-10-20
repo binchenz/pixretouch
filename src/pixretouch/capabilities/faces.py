@@ -19,6 +19,10 @@
 - 下载三级：本地缓存 → hf-mirror（huggingface_hub）→ ModelScope（requests），
   全部失败抛 RuntimeError（结构化消息，MCP 工具层原样传播）。
 
+句柄生命周期：mediapipe Tasks 句柄不直接暴露给调用线程——收容于专职推理线程
+（串行执行、调用带超时、超时即代际回收自愈）；实证依据与纪律 9 例外说明见
+「推理容器」节与 issue #5。
+
 MCP stdio 纪律：本模块不 print；日志一律 logging→stderr。
 """
 from __future__ import annotations
@@ -26,11 +30,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import queue
 import sqlite3
+import threading
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from .. import config
 from . import weight
@@ -115,14 +123,16 @@ def model_path(name: str, models_dir: Path | None = None) -> Path:
     except Exception as e:  # noqa: BLE001
         log.warning("hf-mirror fetch failed for %s: %s: %s", name, type(e).__name__, e)
 
-    # 2) ModelScope 兜底
+    # 2) ModelScope 兜底（modelscope_file 支持兜底源内不同布局，如嵌套 models/buffalo_l/）
     ms_id = spec.get("modelscope")
     if ms_id:
         try:
             import requests
 
-            url = f"{config.MODELSCOPE_BASE}/models/{ms_id}/resolve/master/{spec['file']}"
-            tmp = root / (spec["file"] + ".part")
+            ms_file = spec.get("modelscope_file", spec["file"])
+            url = f"{config.MODELSCOPE_BASE}/models/{ms_id}/resolve/master/{ms_file}"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.parent / (dest.name + ".part")
             with requests.get(url, stream=True, timeout=600) as r:
                 r.raise_for_status()
                 with open(tmp, "wb") as f:
@@ -143,60 +153,119 @@ def model_path(name: str, models_dir: Path | None = None) -> Path:
     )
 
 
-# ------------------------------------------------------------------ 推理单例
-_model_cache: dict[str, Any] = {}
+# ------------------------------------------------------------------ 推理容器
+# 句柄生命周期纪律（纪律 9 对齐 + 实证例外，lead 预批准 2026-10-21，issue #5）：
+#
+# 纪律 9 标准形 = 模块级常驻单例 + 双检锁创建 + 无线程本地副本（ORT/torch 域沿用）。
+# mediapipe Tasks 例外的实证依据：其 Python 绑定 SerialDispatcher 把 C 调用提交到
+# 内部单线程 executor 后做**无超时** future.result() 等待；issue #5 复现的 A 类挂起
+# 原生栈（var/qa/devb_A_hang_native_sample.txt）显示：调用线程永久停在 Python 锁
+# 等待（future waiter），而两个 executor 工作线程空闲、队列为空、mediapipe C++ 池
+# （drishti×16 + fiber×2）全部空闲——完成事件在绑定层内部丢失，Python 侧不可修复，
+# 且非实例泄漏（实例数恒为 2）。
+#
+# 容器化方案（确定性 + 自愈）：
+# - 全部 mediapipe 推理经队列串行到**专职 owner 线程**；句柄只在当代 owner 线程内
+#   创建与使用（纪律 9「无跨线程复用」的最强形式：单使用者=单 owner 线程）；
+# - 调用方带超时等待：LOAD_TIMEOUT_S（首载）与 INFER_TIMEOUT_S（单图推理）分设；
+# - 超时 = 当代失联 → 毒化弃置：owner 线程为 daemon、只持有 mediapipe 句柄与纯数据
+#   任务（**从不触碰 engine 会话/DB 连接/文件句柄**——弃置的是原生图资源与该线程
+#   本身，Python 侧无泄漏面）；下次调用自动重建下一代；
+# - 效果：把「server 永久挂起」降级为「一次结构化超时错误 + 自愈」。
+# 正常路径句柄仍常驻（ADR-0003），无每调用建-关开销。
+
+LOAD_TIMEOUT_S = 90.0     # 首次调用（import mediapipe + 建句柄 + 首推理，实测 ~5s，裕度 >15x）
+INFER_TIMEOUT_S = 30.0    # 单图推理（fixture 实测 <0.5s，裕度 >60x）
 
 
-def _mp_image(image_path: Path):
-    """读图为 mediapipe SRGB Image；返回 (mp_image, width, height)。"""
-    import mediapipe as mp
-    import numpy as np
-    from PIL import Image
+class _InferenceGeneration:
+    """一代推理容器：专职 owner 线程 + 该线程私有的句柄表（队列串行，无锁推理）。"""
 
-    with Image.open(image_path) as im:
-        arr = np.asarray(im.convert("RGB"))
-    return mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(arr)), arr.shape[1], arr.shape[0]
+    def __init__(self, gen_id: int):
+        self.gen_id = gen_id
+        self.handles: dict[str, Any] = {}   # 仅 owner 线程读写；warm 是外部只读视图
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread = threading.Thread(
+            target=self._run, name=f"pixretouch-face-infer-{gen_id}", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            job = self._q.get()
+            if job is None:                  # 优雅收场（reset_models 测试钩子）
+                for h in list(self.handles.values()):
+                    try:
+                        h.close()
+                    except Exception:        # noqa: BLE001
+                        pass
+                self.handles.clear()
+                return
+            fn, args, fut = job
+            if not fut.set_running_or_notify_cancel():
+                continue                     # 调用方已放弃（理论上不发生，防御）
+            try:
+                fut.set_result(fn(self.handles, *args))
+            except BaseException as e:       # noqa: BLE001  异常随 future 回传调用方
+                fut.set_exception(e)
+
+    @property
+    def warm(self) -> bool:
+        return bool(self.handles)
+
+    def submit(self, fn: Callable, *args: Any) -> Future:
+        fut: Future = Future()
+        self._q.put((fn, args, fut))
+        return fut
+
+    def request_shutdown(self) -> None:
+        self._q.put(None)
 
 
-def _detector():
-    if "detector" not in _model_cache:
-        import mediapipe as mp
-        from mediapipe.tasks import python as mp_python
-        from mediapipe.tasks.python import vision
+class _FaceInference:
+    """模块级单例（纪律 9 话语体系）：代际计数器 + 当代引用 + 创建锁。"""
 
-        opts = vision.FaceDetectorOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=str(model_path("face_detector"))),
-            min_detection_confidence=DETECTION_CONFIDENCE,
-        )
-        _model_cache["detector"] = vision.FaceDetector.create_from_options(opts)
-    return _model_cache["detector"]
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._gen: _InferenceGeneration | None = None
+        self.gen_counter = 0
+
+    def call(self, fn: Callable, *args: Any) -> Any:
+        """串行提交到当代 owner 线程；超时毒化当代并抛 RuntimeError（结构化，可重试）。"""
+        with self._lock:
+            if self._gen is None:
+                self.gen_counter += 1
+                self._gen = _InferenceGeneration(self.gen_counter)
+            gen = self._gen
+        timeout = INFER_TIMEOUT_S if gen.warm else LOAD_TIMEOUT_S
+        fut = gen.submit(fn, *args)
+        try:
+            return fut.result(timeout=timeout)
+        except FuturesTimeout:
+            with self._lock:
+                if self._gen is gen:         # 只毒化当代，防重复回收
+                    self._gen = None
+            log.error("mediapipe 推理超时（>%.0fs, gen=%s）：当代句柄已弃置，下次调用自动重建",
+                      timeout, gen.gen_id)
+            raise RuntimeError(
+                f"mediapipe inference timeout (>{timeout:.0f}s, gen={gen.gen_id}): "
+                f"疑似绑定层丢失唤醒（SerialDispatcher future 永不完成，见 issue #5）；"
+                f"当代句柄已弃置，重试本调用即自动重建"
+            ) from None
+
+    def shutdown(self) -> None:
+        """优雅关闭当代（测试钩子；ADR-0003 常驻进程正常不调用）。"""
+        with self._lock:
+            gen, self._gen = self._gen, None
+        if gen is not None:
+            gen.request_shutdown()
 
 
-def _landmarker(num_faces: int):
-    key = f"landmarker:{num_faces}"
-    if key not in _model_cache:
-        import mediapipe as mp
-        from mediapipe.tasks import python as mp_python
-        from mediapipe.tasks.python import vision
-
-        opts = vision.FaceLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=str(model_path("face_landmarker"))),
-            num_faces=num_faces,
-            min_face_detection_confidence=DETECTION_CONFIDENCE,
-            min_face_presence_confidence=FACE_PRESENCE_CONFIDENCE,
-        )
-        _model_cache[key] = vision.FaceLandmarker.create_from_options(opts)
-    return _model_cache[key]
+_INFERENCE = _FaceInference()
 
 
 def reset_models() -> None:
-    """释放已驻留的检测器/landmarker（测试钩子；ADR-0003 常驻进程正常不调用）。"""
-    for obj in _model_cache.values():
-        try:
-            obj.close()
-        except Exception:  # noqa: BLE001
-            pass
-    _model_cache.clear()
+    """优雅关闭当代推理容器（测试钩子；常驻进程正常不调用，ADR-0003）。"""
+    _INFERENCE.shutdown()
 
 
 # ------------------------------------------------------------------ 检测
@@ -258,26 +327,45 @@ def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def detect(image_path: Path, max_faces: int = 8) -> list[Face]:
-    """检测人脸 + 478 点 landmark；detector 框与 landmarker 点按 IoU 配对。
+def _detect_job(handles: dict[str, Any], rgb_arr, max_faces: int, det_model: str, lmk_model: str) -> list["Face"]:
+    """owner 线程作业：句柄懒建（仅本线程创建/使用）→ 推理 → 转纯数据 Face 列表。
 
-    landmarker 独有命中（detector 漏检）时 bbox 取 landmark 包络、quality=None。
-    模型缺失/下载失败抛 RuntimeError（结构化，工具层原样传播）。
+    跨线程只传纯数据（numpy 数组进、dataclass 出）；C 支撑的 result 对象不出本线程。
     """
-    image_path = Path(image_path)
-    mp_image, w, h = _mp_image(image_path)
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision
 
-    det_result = _detector().detect(mp_image)
+    det = handles.get("detector")
+    if det is None:
+        det_opts = vision.FaceDetectorOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=det_model),
+            min_detection_confidence=DETECTION_CONFIDENCE,
+        )
+        det = handles["detector"] = vision.FaceDetector.create_from_options(det_opts)
+    lkey = f"landmarker:{max_faces}"
+    lmk = handles.get(lkey)
+    if lmk is None:
+        lmk_opts = vision.FaceLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=lmk_model),
+            num_faces=max_faces,
+            min_face_detection_confidence=DETECTION_CONFIDENCE,
+            min_face_presence_confidence=FACE_PRESENCE_CONFIDENCE,
+        )
+        lmk = handles[lkey] = vision.FaceLandmarker.create_from_options(lmk_opts)
+
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_arr)
+    h, w = rgb_arr.shape[0], rgb_arr.shape[1]
+
     det_boxes: list[tuple[tuple[int, int, int, int], float | None]] = []
-    for d in det_result.detections:
+    for d in det.detect(mp_image).detections:
         bb = d.bounding_box
         score = d.categories[0].score if d.categories else None
         det_boxes.append(((int(bb.origin_x), int(bb.origin_y), int(bb.width), int(bb.height)), score))
 
-    lm_result = _landmarker(max_faces).detect(mp_image)
     faces: list[Face] = []
     used: set[int] = set()
-    for landmarks in lm_result.face_landmarks:
+    for landmarks in lmk.detect(mp_image).face_landmarks:
         pts = [(p.x * w, p.y * h) for p in landmarks]
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
@@ -306,6 +394,25 @@ def detect(image_path: Path, max_faces: int = 8) -> list[Face]:
             ear_right=round(eye_aspect_ratio([pts[i] for i in RIGHT_EYE]), 4),
         ))
     return faces
+
+
+def detect(image_path: Path, max_faces: int = 8) -> list[Face]:
+    """检测人脸 + 478 点 landmark；detector 框与 landmarker 点按 IoU 配对。
+
+    推理经专职 owner 线程串行执行，调用带超时、超时毒化当代并自愈（见推理容器节）。
+    landmarker 独有命中（detector 漏检）时 bbox 取 landmark 包络、quality=None。
+    模型缺失/下载失败/推理超时抛 RuntimeError（结构化，工具层原样传播）。
+    """
+    import numpy as np
+    from PIL import Image
+
+    image_path = Path(image_path)
+    with Image.open(image_path) as im:
+        rgb_arr = np.ascontiguousarray(np.asarray(im.convert("RGB")))
+    # 权重供给（含潜在网络下载）在调用方线程完成，不占推理超时预算
+    det_model = str(model_path("face_detector"))
+    lmk_model = str(model_path("face_landmarker"))
+    return _INFERENCE.call(_detect_job, rgb_arr, max_faces, det_model, lmk_model)
 
 
 # ------------------------------------------------------------------ 持久化

@@ -333,3 +333,67 @@ def test_mini_album_verdicts(isolated_home):
     # 报告落盘在隔离 VAR_DIR 下（不碰真实 var/）
     assert Path(rep["report_path"]).exists()
     assert str(isolated_home) in rep["report_path"]
+
+
+# ------------------------------------------------------------------ 推理容器（issue #5 A 类挂起回归）
+def test_inference_container_timeout_recycles_generation(monkeypatch):
+    """容器自愈（无需模型，顺序无关）：作业超时 → 结构化 RuntimeError + 当代毒化；
+    下次调用重建新代（计数器 +1）并正常返回。"""
+    import time
+
+    inf = F._INFERENCE
+    monkeypatch.setattr(F, "LOAD_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(F, "INFER_TIMEOUT_S", 0.5)
+    with pytest.raises(RuntimeError, match="timeout"):
+        inf.call(lambda handles: time.sleep(5))
+    assert inf._gen is None, "超时后当代必须被毒化弃置"
+
+    counter_at_poison = inf.gen_counter
+    monkeypatch.setattr(F, "LOAD_TIMEOUT_S", 15.0)
+    r = inf.call(lambda handles: ("ok", isinstance(handles, dict)))
+    assert r == ("ok", True), "自愈：新代必须正常执行作业"
+    assert inf.gen_counter == counter_at_poison + 1, "毒化后下次调用必须重建新代"
+    F.reset_models()
+
+
+@needs_models
+@needs_fixtures
+def test_assess_then_detect_cross_thread_no_deadlock(isolated_home):
+    """回归（issue #5 A 类挂起）：assess×6 → detect_faces，每步各在新线程执行
+    （模拟 MCP 工作线程派发）；超时守卫：任何一步挂起即红，且 daemon 线程不阻塞
+    pytest 退出。容器化后最坏情形 = 结构化超时错误（status=error）而非永久挂起。
+    """
+    import threading
+
+    names = [
+        "portrait-01-frontal-clear.jpg",
+        "portrait-02-frontal-clear.jpg",
+        "group-01-three-frontal.jpg",
+        "eyes-closed-01-negative.jpg",
+        "waste-blur-01.jpg",
+        "lowres-01.jpg",
+    ]
+    ids = {}
+    for n in names:
+        conn, ing = _ingest(FIXTURES / n)
+        ids[n] = ing["image_id"]
+
+    results: dict = {}
+
+    def run(key, fn, *a):
+        results[key] = fn(*a)
+
+    for n in names:
+        t = threading.Thread(target=run, args=(n, A.assess_image_op, ids[n]), daemon=True)
+        t.start()
+        t.join(timeout=180)
+        assert not t.is_alive(), f"assess({n}) 挂起（issue #5 A 类回归）"
+        assert results[n]["status"] == "ok", results[n]
+
+    t = threading.Thread(target=run, args=("detect", A.detect_faces_op,
+                                           ids["group-01-three-frontal.jpg"]), daemon=True)
+    t.start()
+    t.join(timeout=180)
+    assert not t.is_alive(), "detect_faces 在 assess×6 后挂起（issue #5 A 类回归）"
+    assert results["detect"]["status"] == "ok", results["detect"]
+    assert results["detect"]["face_count"] == 3
