@@ -13,6 +13,7 @@ dependencies = [
   "pillow>=10",
   "numpy>=1.26",
   "opencv-python>=4.9",
+  "mediapipe>=0.10",
   "torch>=2.3",
   "huggingface_hub>=0.24",
   "requests>=2.31",
