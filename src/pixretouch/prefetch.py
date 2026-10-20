@@ -16,7 +16,9 @@ log = logging.getLogger("pixretouch.prefetch")
 
 
 def fetch_all() -> dict[str, Any]:
-    from .capabilities import WEIGHT_SPECS
+    from .capabilities import WEIGHT_SPECS, load_all
+
+    load_all()  # 触发各能力模块 @capability/weight 注册副作用，否则注册表恒空
 
     if not WEIGHT_SPECS:
         return {"registry_empty": True, "results": {}}

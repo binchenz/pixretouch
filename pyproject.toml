@@ -9,7 +9,7 @@ description = "Agent-native photo retouching pipeline for DSH — whitebox repli
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "mcp[cli]>=1.2",
+  "mcp[cli]>=2,<3",  # 2.x API：MCPServer（v1 的 mcp.server.fastmcp 已移除）
   "pillow>=10",
   "numpy>=1.26",
   "opencv-python>=4.9",

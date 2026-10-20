@@ -38,7 +38,9 @@ def _check_torch() -> dict[str, Any]:
 
 def _check_libs() -> dict[str, Any]:
     out: dict[str, Any] = {}
-    for name in ("PIL", "cv2", "numpy", "mcp", "huggingface_hub", "requests"):
+    # pixretouch.server = 真实 import server 入口（MCPServer 注册全部工具），防止仅查
+    # 顶层 mcp 掩盖 API 断裂（工单03 教训：mcp 2.x 移除 mcp.server.fastmcp，骨架期从未真实握手）
+    for name in ("PIL", "cv2", "numpy", "mcp", "huggingface_hub", "requests", "pixretouch.server"):
         try:
             mod = __import__(name)
             out[name] = {"ok": True, "version": getattr(mod, "__version__", "unknown")}
