@@ -8,12 +8,18 @@
 | `portrait-01-frontal-clear.jpg` | 单人清晰正脸（ Barack Obama 官方总统肖像） | 820×1024 | 176,561 | https://storage.googleapis.com/mediapipe-assets/portrait.jpg | **公有领域**（美国联邦政府作品，白宫官方肖像）；经 Google MediaPipe 项目测试资产桶分发 |
 | `portrait-02-frontal-clear.jpg` | 单人清晰正脸（商务人像，白底） | 958×1358 | 234,826 | https://storage.googleapis.com/mediapipe-assets/business-person.png | **MediaPipe 项目分发测试数据**（MediaPipe 仓库 Apache-2.0）；qa 以 sips 转 JPEG（quality 82）压至 ≤300KB |
 | `group-01-three-frontal.jpg` | 3 人合影、正脸清晰（Apollo 11 机组官方合影：Armstrong / Collins / Aldrin） | 1280×1027 | 172,340 | https://images-assets.nasa.gov/image/S69-31740/S69-31740~medium.jpg | **公有领域**（NASA 图片，美国联邦政府作品，NASA ID S69-31740） |
+| `eyes-closed-01-negative.jpg` | 单人正脸、双眼闭合（EAR 负例） | 1000×667 | 69,521 | https://www.pexels.com/photo/8955459/ （直链 images.pexels.com/photos/8955459/） | **Pexels License**（免费使用与再分发，无需署名） |
+| `waste-blur-01.jpg` | 模糊废片（清晰度维度反例） | 820×1024 | 54,687 | 派生：`portrait-01` 经 ffmpeg `gblur=sigma=7` | 派生自公有领域作品（PD derivative） |
+| `lowres-01.jpg` | 低分辨率小图（超分/质检维度） | 113×160 | 6,924 | 派生：`portrait-02` 经 sips `-Z 160` | 派生自 MediaPipe 项目分发测试数据 |
 
 ## 用途映射
 
 - `portrait-01` / `portrait-02`：单人正脸——人脸检测/landmark/EAR 正例、磨皮/增强/调色的单对象输入。
 - `group-01`：2~3 人合影——人物聚类（多脸同框）、按人寻址（cluster_id）的输入。
-- 废片（闭眼/模糊）与低分辨率小图：后续以合成方式补充（sips/ffmpeg 降质），不占真人脸来源配额。
+- `eyes-closed-01-negative`：EAR 闭眼负例（与两张 portrait 正例配对）。
+- `waste-blur-01` / `lowres-01`：选片质检淘汰维度（清晰度/分辨率）反例；lowres 兼作超分输入。
+- 合成辅助件（渐变图/40MP 大图/截断坏图/同人脸裁切）在 var/qa/synth/（gitignored），
+  来源见 var/qa/synth/SOURCES.md。
 
 ## 制备期拒用记录（版权把关）
 
