@@ -1,0 +1,19 @@
+# 隐私红线：验收照片与一切本地图像产物永不入库
+album-inbox/
+cache/
+renders/
+exports/
+*.db
+*.db-wal
+*.db-shm
+
+# 模型权重与虚拟环境
+models/
+weights/
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+.DS_Store
+.scratch/
