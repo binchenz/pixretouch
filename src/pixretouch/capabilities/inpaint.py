@@ -31,6 +31,13 @@
    进缓存键并落 records.mask_sha256。预构建对象经 ctx.payload 传入渲染函数——payload
    不得影响确定性（仅凭 params 重建结果一致）。mask 源于模型的能力（如皮肤磨皮）
    在渲染 mask 后同样算 sha 传入。
+   mask 通道语义（工单 08 补充，lead 裁决）：mask 通道承载「渲染实际消费的权重/
+   蒙版图」（blemish=提示 mask、cutout=alpha、bg_blur=虚化权重图 t）。params 可
+   确定性派生的 mask 仅记 sha；模型派生的 mask（alpha/深度类）另做**双登记**——
+   cache.put("mask:"+sha) 固化内容寻址文件 + 工具结果返回 mask_path/alpha_path，
+   且记录 output 保持图像状态（如 cutout=RGBA PNG）保证链可组合；外部素材引用
+   （如 background_path）以其内容 sha256 记入 params 参与缓存键。#12 预设方案
+   引擎按此语义消费。
    **缓存键是链位置敏感的**：key = (当前记录的输出哈希, 能力, 规范化参数, mask_sha)，
    ADR-0002 设计使然。冒烟测试必守三条推论：
    a) 测「同参重调 cache_hit=true」的正确姿势 = 先 rollback_to 回同一链态，再同参

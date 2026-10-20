@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import threading
 import uuid
@@ -40,6 +41,18 @@ def reset_session() -> None:
     if sess is not None:
         sess[0].close()
         _local.session = None
+
+
+def png_sha256(img: Any) -> str:
+    """PIL 图像的 PNG 字节 sha256（PIL PNG 编码无时间戳，同图确定）。
+
+    mask/alpha/权重图类产物的规范哈希：进 records.mask_sha256 与缓存键（ADR-0002）。
+    """
+    import io
+
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return hashlib.sha256(buf.getvalue()).hexdigest()
 
 
 @dataclass

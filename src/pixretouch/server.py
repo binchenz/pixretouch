@@ -3,7 +3,8 @@
 stdio 传输；stdout 是协议信道，任何日志只走 stderr。
 基于 mcp 2.x：from mcp.server import MCPServer（v1 的 mcp.server.fastmcp 已移除）。
 工具随能力工单逐个挂载：doctor（工单01）、blemish_remove（工单03）、
-assess_image / detect_faces / selection_report（工单04）。
+assess_image / detect_faces / selection_report（工单04）、
+cutout / bg_replace / bg_blur（工单08）。
 挂载模式（后续能力照抄）：from .capabilities import <name> 触发注册副作用，
 @mcp.tool() 只做薄包装，逻辑全部在能力模块的 <tool>_op() 里。
 """
@@ -17,6 +18,8 @@ from mcp.server import MCPServer  # mcp 2.x API（v1 的 mcp.server.fastmcp 已�
 
 from . import doctor as doctor_mod
 from .capabilities import assess as assess_cap  # 逻辑主体（工单 04：选片质检）
+from .capabilities import background as background_cap  # 逻辑主体（工单 08：背景替换/虚化）
+from .capabilities import cutout as cutout_cap  # 逻辑主体（工单 08：主体抠图）
 from .capabilities import inpaint as inpaint_cap  # noqa: F401  能力注册副作用（工单 03）
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -100,6 +103,70 @@ def selection_report(image_ids: list[int] | None = None) -> dict[str, Any]:
         失败 {status:"error", error}。
     """
     return assess_cap.selection_report_op(image_ids)
+
+
+@mcp.tool()
+def cutout(image_id: int) -> dict[str, Any]:
+    """主体抠图（ISNet）：产出 alpha 蒙版；记录产物=RGBA PNG，alpha 双登记为独立产物。
+
+    Args:
+        image_id: 库内图像 ID（ingest 返回）。作用于当前态指针指向的产物；
+            当前态已是 RGBA（抠过）则直接复用其 alpha（链组合，零推理）。
+
+    Returns:
+        成功 {status:"ok", record_id, output_sha256, output_path, cache_hit,
+        mask_sha256, alpha_sha256, alpha_path}；
+        失败 {status:"error", error}（结构化错误，不抛穿）。
+    """
+    return cutout_cap.cutout_op(image_id)
+
+
+@mcp.tool()
+def bg_replace(
+    image_id: int,
+    color: list[int] | None = None,
+    background_path: str | None = None,
+    feather: float = 2.0,
+    despill: bool = True,
+) -> dict[str, Any]:
+    """背景替换：主体抠图与纯色或指定背景图合成（边缘羽化+溢色处理）；追加记录链，可回滚。
+
+    Args:
+        image_id: 库内图像 ID。当前态为 RGBA（已抠图）时直接复用其 alpha。
+        color: 纯色背景 [r,g,b]，0..255；与 background_path 二选一。
+        background_path: 背景图路径（绝对或相对项目根）；内容 sha256 自动进缓存键。
+        feather: 边缘羽化半径（像素），0..10，默认 2。
+        despill: 溢色处理（premultiplied 腐蚀采样），默认 true。
+
+    Returns:
+        成功 {status:"ok", record_id, output_sha256, output_path, cache_hit,
+        mask_sha256, mask_path}（mask=羽化后 alpha）；失败 {status:"error", error}。
+    """
+    return background_cap.bg_replace_op(image_id, color=color, background_path=background_path,
+                                        feather=feather, despill=despill)
+
+
+@mcp.tool()
+def bg_blur(
+    image_id: int,
+    strength: float = 0.6,
+    max_blur: int = 31,
+    focus: float = 0.9,
+) -> dict[str, Any]:
+    """背景虚化：Depth-Anything-V2 深度驱动的自然虚化；主体（depth≥focus）清晰度不变。
+
+    Args:
+        image_id: 库内图像 ID。
+        strength: 虚化强度 (0,1]，默认 0.6。
+        max_blur: 最大模糊核直径 px（自动取奇数），3..101，默认 31。
+        focus: 主体保护深度阈值 (0,1]，默认 0.9。
+
+    Returns:
+        成功 {status:"ok", record_id, output_sha256, output_path, cache_hit,
+        mask_sha256, mask_path}（mask=虚化权重图 t，t=0 处恒清晰）；
+        失败 {status:"error", error}。
+    """
+    return background_cap.bg_blur_op(image_id, strength=strength, max_blur=max_blur, focus=focus)
 
 
 def main() -> None:
