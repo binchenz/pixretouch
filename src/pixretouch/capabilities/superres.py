@@ -4,10 +4,16 @@ super_resolve(image_id, scale∈{2,4})：原生 x2/x4 双 ONNX 权重放大低�
 
 大图分块（验收核心）：输入按 256px 瓦片 + 16px 单边重叠（stride 224）网格切分，
 逐瓦片推理，**只回贴有效中心区**——模型边缘伪影落在重叠带内被丢弃，瓦片接缝处
-输出为相邻瓦片各自「远离边界」的区域拼接，无可见接缝；内存峰值 = 单瓦片 float
-中间态 + 全幅输出 uint8 画布（40MP×2 ≈ 1.5GB 峰值，M2 Max/32GB 余量充足，
-边界测算见 issue #11 评论）。分块常数是输出字节的一部分 → tiler 描述串进 params
-参与缓存键（改常数必须升 TILER_VERSION，旧缓存自然失效）。
+输出为相邻瓦片各自「远离边界」的区域拼接，无可见接缝；瓦片内部 mod-4 对齐 pad
+（奇边输入安全，qa #11 回归）。内存峰值 = 单瓦片 float 中间态 + 全幅输出 uint8
+画布（40MP×2 实测峰值 RSS 1925MB，M2 Max/32GB 余量充足，边界测算见 issue #11）。
+分块常数是输出字节的一部分 → tiler 描述串进 params 参与缓存键（改常数必须升
+TILER_VERSION，旧缓存自然失效）。
+
+输入域留档（qa 探针实证 2026-10-21）：PIL DecompressionBomb 安全阈值（~178MP 硬错、
+~89MP 警告）先于本模块 65500px/8GB 输出守卫触发——超大输入在 Image.open 即被
+结构化错误容器化（status=error）。**不解除 PIL 安全阈值**（zip-bomb 防线）；
+一期输入域实际软上限以 PIL 阈值为准，输出域上限以双守卫为准。
 
 RGBA 链态（纪律 8 增补，几何变换类能力）：RGB 走模型超分；alpha 通道以 lanczos
 确定性重采样同步放大——alpha 是蒙版语义，不进生成式模型（防幻觉边缘）；产物保持
@@ -79,10 +85,23 @@ def _windows(dim: int) -> list[int]:
 
 
 def _run_tile(sess: Any, tile_rgb: Any, scale: int) -> Any:
-    """单瓦片推理：uint8 HWC RGB → uint8 HWC RGB（×scale）。"""
+    """单瓦片推理：uint8 HWC RGB → uint8 HWC RGB（×scale）。
+
+    奇边修复（qa #11 实证）：RRDBNet 内部 pixel-shuffle/上采样要求输入边长为
+    模型倍数对齐（奇边 → ONNX Reshape 崩）。瓦片先 symmetric pad 到 **mod-4**
+    （x2 的 pixel-shuffle 需偶边；mod-4 对 ×2/×4 双模型统一留余量），推理后裁回
+    原边×scale；边缘/小图奇边瓦片同路径处理。pad/裁回确定性；偶边输入输出字节与
+    修复前完全一致——TILER_VERSION 无需递增（修复前奇边路径只产生结构化错误，
+    不存在缓存条目）。
+    """
     import numpy as np
 
-    t = tile_rgb[:, :, ::-1] if _INPUT_BGR else tile_rgb  # RGB↔BGR（按实测约定）
+    h, w = tile_rgb.shape[:2]
+    ph, pw = (-h) % 4, (-w) % 4
+    t = tile_rgb
+    if ph or pw:
+        t = np.pad(t, ((0, ph), (0, pw), (0, 0)), mode="symmetric")
+    t = t[:, :, ::-1] if _INPUT_BGR else t  # RGB↔BGR（按实测约定）
     x = np.ascontiguousarray(
         np.transpose(t.astype(np.float32) / 255.0, (2, 0, 1))[None]
     )
@@ -92,7 +111,8 @@ def _run_tile(sess: Any, tile_rgb: Any, scale: int) -> Any:
         out = np.transpose(out, (1, 2, 0))
     if _INPUT_BGR:
         out = out[:, :, ::-1]
-    return np.clip(out * 255.0, 0, 255).round().astype(np.uint8)
+    out = np.clip(out * 255.0, 0, 255).round().astype(np.uint8)
+    return out[: h * scale, : w * scale]
 
 
 def upscale(rgb_u8: Any, scale: int) -> Any:

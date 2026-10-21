@@ -132,6 +132,40 @@ def test_scale4_small(isolated_home, small_photo):
 
 
 @requires_esrgan
+def test_odd_and_extreme_dimensions(isolated_home, tmp_path):
+    """奇边/质数尺寸/极端长宽比回归（qa #11 实证 FAIL 的修复面，lead fix-first 插单）。
+
+    pixel-shuffle 需模型倍数对齐——瓦片内部 mod-4 pad 后推理、裁回；
+    断言输出尺寸精确 = 输入 × scale（外部行为），结构化错误不再出现。
+    """
+    from pixretouch import server
+
+    cases = [
+        (113, 160, 2),   # qa 复现口径：奇宽
+        (97, 63, 2),     # 双质数
+        (113, 160, 4),   # 奇宽 ×4
+        (640, 9, 2),     # 极端长宽比：横条（多瓦片 x 奇高尾块）
+        (9, 320, 2),     # 极端长宽比：竖条
+    ]
+    for w, h, scale in cases:
+        p = tmp_path / f"dim_{w}x{h}_x{scale}.png"
+        rng = np.random.default_rng(w * 7 + h * 13 + scale)
+        Image.fromarray(rng.integers(0, 255, (h, w, 3), dtype=np.uint8)).save(p, "PNG")
+        conn, ing = _ingest(p)
+        r = server.super_resolve(ing["image_id"], scale=scale)
+        assert r["status"] == "ok", (w, h, scale, r)
+        assert Image.open(r["output_path"]).size == (w * scale, h * scale), (w, h, scale)
+
+    # qa 原始复现物（真实照片派生 fixture，113×160）
+    lowres = REPO_ROOT / "tests" / "fixtures" / "mini-album" / "lowres-01.jpg"
+    if lowres.exists():
+        conn, ing = _ingest(lowres)
+        r = server.super_resolve(ing["image_id"], scale=2)
+        assert r["status"] == "ok", r
+        assert Image.open(r["output_path"]).size == (226, 320)
+
+
+@requires_esrgan
 @requires_isnet
 def test_rgba_alpha_lanczos_upscaled(isolated_home, tmp_path):
     """RGBA 链态（纪律 8 几何增补）：RGB 走模型，alpha lanczos 同步放大且字节级相等。"""
