@@ -20,10 +20,11 @@
 //   album_name:   string|null   导出相册名；缺省 null=album_<时间戳>
 // }
 //
-// 硬规则：与 album-apply.js P1~P6 完全一致（apply 段同一策略文本，双向锁定
-// tests/test_e2e_album.py 的 MCP 序列复刻）。O3 裁决：自动取舍**不另设常数**，
-// 直接消费 selection_report 的 verdict（唯一事实源=工单04 assess 校准）：
-// keep→套用、review→套用（联络表打标）、reject→跳过并列入返回报告。
+// 硬规则：与 album-apply.js P1~P7 完全一致（apply 段同一策略文本，双向锁定
+// tests/test_e2e_album.py 的 MCP 序列复刻）。含 P7：无人脸图 person 段跳过 +
+// person_skipped 审计字段 + image 段照常（计 ok 不隔离）。O3 裁决：自动取舍
+// **不另设常数**，直接消费 selection_report 的 verdict（唯一事实源=工单04 assess
+// 校准）：keep→套用、review→套用（联络表打标）、reject→跳过并列入返回报告。
 //
 // 返回（无损 JSON）：{ingest, selection, clusters, apply:{...}, contact_sheet, export}
 // ============================================================================
@@ -114,6 +115,7 @@ const batchPrompt = (batch) => `你在执行 PixRetouch 一发模式的批量套
 硬规则：
 - error 含 "mediapipe inference timeout" → 同参重试一次（事务化零残留），仍失败 → 隔离。
 - 调用超时/中断 → 不当失败：history 对比基线——链已增长=已套用，计 ok 禁止重跑；未增长 → 等 30 秒复查，仍未增长 → 同参重试一次，再失败 → 隔离。
+- 返回 ok 且含 person_skipped 字段 → 无人脸图（风景/静物）：person 段跳过、image 段已照常执行——计 ok，不隔离。
 - 其余错误 → 直接隔离。
 
 批次清单：${batch.map((id) => `image_id=${id}`).join(", ")}
@@ -128,7 +130,8 @@ const applyResults = await pipeline(batches, async (_prev, batch, i) =>
         results: { type: "array", items: { type: "object", properties: {
           image_id: { type: "integer" }, status: { type: "string", enum: ["ok", "isolated"] },
           suit: { type: "string" }, record_ids: { type: "array", items: { type: "integer" } },
-          attempts: { type: "integer" }, assess: { type: "string" }, error: { type: "string" },
+          attempts: { type: "integer" }, assess: { type: "string" }, person_skipped: { type: "string" },
+          error: { type: "string" },
         }, required: ["image_id", "status"], additionalProperties: true } },
       },
       required: ["results"], additionalProperties: false,

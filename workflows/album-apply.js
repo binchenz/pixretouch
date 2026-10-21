@@ -33,6 +33,9 @@
 // P6 尾段 contact_sheet 只读当前态产物缩略、无重渲染（天然安全）；检查点3「淘汰单张
 //    重修」= 对话直调 history/rollback_to（e604803 工具面）+ 能力工具，或对子集重跑
 //    本脚本（幂等：缓存命中使重跑便宜）。
+// P7 无人脸图（风景/静物）：图级 apply_preset 的 person 域步骤整体跳过 + image 域照常
+//    执行 + 返回 person_skipped 审计字段（dev-b 裁决 2026-10-21）——计 ok，不是错误，
+//    fan-out 无需为风景图做特殊隔离分支。显式 cluster_id 寻址无脸仍响亮报错（走 P4）。
 //
 // 返回（无损 JSON）：{total, applied, isolated[], batch_failed[], contact_sheet}
 // batch_failed 仅在 agent()=null（子代理级崩溃）时出现——整批未处理，可原样重跑本
@@ -61,12 +64,13 @@ const batchPrompt = (batch) => `你在执行 PixRetouch 相册批量套用的一
 硬规则（严格遵守）：
 - 返回 error 含 "mediapipe inference timeout" → 同参重试 apply_preset 一次（事务化、失败零残留、重跑安全），仍失败 → 隔离。
 - 调用超时/被中断 → 不当失败：查 history(image_id) 对比基线——链已增长=实际已套用，计 ok，禁止重跑；未增长 → 等 30 秒复查一次，仍未增长 → 同参重试一次，再失败 → 隔离。
+- 返回 ok 且含 person_skipped 字段 → 无人脸图（风景/静物）：person 段跳过、image 段已照常执行——计 ok，不是错误，不隔离。
 - 其余错误 → 直接隔离（status="isolated"，error 记原文）。
 
 批次清单：
 ${batch.map((id) => `- image_id=${id}：suit="${routing[id] || "natural"}"`).join("\n")}
 
-返回 JSON：{results:[{image_id, status:"ok"|"isolated", suit, record_ids, attempts, assess, error}]}——批内每张图都要有一条结果（含隔离的）。`;
+返回 JSON：{results:[{image_id, status:"ok"|"isolated", suit, record_ids, attempts, assess, person_skipped?, error}]}——批内每张图都要有一条结果（含隔离的）。`;
 
 const results = await pipeline(batches, async (_prev, batch, i) =>
   agent(batchPrompt(batch), {
@@ -86,6 +90,7 @@ const results = await pipeline(batches, async (_prev, batch, i) =>
               record_ids: { type: "array", items: { type: "integer" } },
               attempts: { type: "integer" },
               assess: { type: "string" },
+              person_skipped: { type: "string" },
               error: { type: "string" },
             },
             required: ["image_id", "status"],
