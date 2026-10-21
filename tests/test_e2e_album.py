@@ -10,8 +10,9 @@
      images[].{image_id,verdict∈keep/review/reject,score,reasons,assess}）→
      set_verdicts(source="report") 持久化 → 人工推翻（用户故事3）=set_verdicts(source="human")；
   S1 聚类：cluster_faces（人物聚类）；
-  S2 批量套用：**骨架期跳过**（apply_preset 依赖 task-9 预设引擎，lead O6；落地后接线，
-     含批式 fan-out 失败隔离 + mediapipe timeout 重试断言）；
+  S2 批量套用：已接线 dev-b c79c73a 契约（suit 按名 fan-out、事务化单图、
+     apply→assess 成对复检硬规则）；失败隔离+timeout 重试策略镜像（lead 裁决2）
+     以故障注入断言；
   S2' 联络表：contact_sheet（review 打标、reject 单列、幂等）；
   S3 导出：export_album（规整命名 + manifest）。
 终态断言：三交付物 + 库（images/records/meta.verdict/clusters）。
@@ -86,9 +87,68 @@ def test_e2e_album_pipeline_skeleton(isolated_home):
     cl = server.cluster_faces(None)
     assert cl["status"] == "ok", cl
 
-    # ---- S2 批量套用：骨架期跳过（task-9 预设引擎落地后接线，lead O6）----
-    # 接线后此处断言：批式 fan-out（默认批10）逐图结果清单、单图失败隔离、
-    # mediapipe timeout 类错误自动重试一次、每图记录链按配方增长。
+    # ---- S2 批量套用（接线 dev-b c79c73a 契约：suit 按名、事务化单图、
+    #      apply→assess 成对复检硬规则；lead 裁决2 策略镜像：timeout 类自动重试
+    #      一次再隔离，其余错误直接隔离——与 workflows/album-apply.js 同一策略）----
+    from pixretouch.capabilities import preset_engine as preset_cap
+
+    def final_verdict(iid: int):
+        m = json.loads(conn.execute("SELECT meta FROM images WHERE id=?", (iid,)).fetchone()["meta"])
+        return (m.get("verdict") or {}).get("value")
+
+    targets = [i for i in ids if final_verdict(i) != "reject"]   # O3：reject→跳过
+    assert by_name["eyes-closed-01-negative.jpg"] not in targets
+    assert waste_id in targets, "人工推翻（source=human）后 fan-out 应消费 meta 终值"
+
+    def apply_with_retry(image_id: int, suit: str = "natural"):
+        r = server.apply_preset(image_id, suit)
+        attempts = 1
+        if r["status"] == "error" and "mediapipe inference timeout" in r.get("error", "").lower():
+            r = server.apply_preset(image_id, suit)   # 事务性保证同参重试安全（dev-b 契约）
+            attempts = 2
+        if r["status"] == "ok":
+            rc = server.assess_image(image_id)         # 质检回路硬规则：修图后必复检
+            assert rc["status"] == "ok", rc
+        return r, attempts
+
+    flaky_id = targets[0]
+    broken_id = targets[1] if len(targets) > 1 else None
+    real_op = preset_cap.apply_preset_op
+    calls: dict[int, int] = {}
+
+    def flaky_op(image_id, suit, cluster_id=None):
+        if image_id == flaky_id:
+            calls[image_id] = calls.get(image_id, 0) + 1
+            if calls[image_id] == 1:
+                return {"status": "error", "error": "RuntimeError: mediapipe inference timeout (容器自愈触发)"}
+        if broken_id is not None and image_id == broken_id:
+            return {"status": "error", "error": "ValueError: 注入的持久性故障"}
+        return real_op(image_id, suit, cluster_id=cluster_id)
+
+    applied, isolated = [], []
+    preset_cap.apply_preset_op = flaky_op
+    try:
+        for iid in targets:
+            r, attempts = apply_with_retry(iid)
+            if r["status"] == "ok":
+                applied.append(iid)
+                assert r["record_ids"] and len(r["record_ids"]) >= 1
+                assert r["routing"], "routing 供联络表「谁用了哪套」打标（dev-b 契约）"
+                hist = data.history(conn, iid)
+                assert len(hist) == 1 + len(r["record_ids"]), "记录链按配方精确增长"
+            else:
+                isolated.append({"image_id": iid, "error": r["error"], "attempts": attempts})
+    finally:
+        preset_cap.apply_preset_op = real_op
+
+    # 失败隔离语义：flaky 重试一次成功；broken 直接隔离且零记录残留；流水线走完全量
+    assert flaky_id in applied and calls[flaky_id] == 2, "timeout 类应自动重试一次并成功"
+    if broken_id is not None:
+        ent = next(x for x in isolated if x["image_id"] == broken_id)
+        assert ent["attempts"] == 1, "非 timeout 类错误直接隔离不重试"
+        assert [h["capability"] for h in data.history(conn, broken_id)] == ["base"], \
+            "事务性：失败 apply 零记录残留（整体无痕）"
+    assert len(applied) + len(isolated) == len(targets), "单图失败不阻塞，流水线走完"
 
     # ---- S2' 联络表（交付物②：HTML+PNG；review 打标、reject 单列、幂等）----
     cs = server.contact_sheet(None)
@@ -112,7 +172,7 @@ def test_e2e_album_pipeline_skeleton(isolated_home):
     out_dir = Path(ex["directory"])
     files = sorted(p.name for p in out_dir.iterdir() if p.suffix != ".json")
     assert len(files) == ex["count"]
-    assert all(re.match(r"^\d{3}_.+\.(jpg|png)$", f) for f in files), files
+    assert all(re.match(r"^\d{3}_.+\.(jpg|png|tif|webp)$", f) for f in files), files
     manifest = json.loads(Path(ex["manifest_path"]).read_text(encoding="utf-8"))
     assert manifest["count"] == ex["count"]
     sample = manifest["items"][0]
@@ -130,10 +190,3 @@ def test_e2e_album_pipeline_skeleton(isolated_home):
     ).fetchone()["c"]
     assert n_verdict == n_images, "verdict 全量持久化在 images.meta"
     assert conn.execute("SELECT COUNT(*) c FROM clusters").fetchone()["c"] >= 1
-
-
-@pytest.mark.skip(reason="S2 apply fan-out 段待 task-9 预设引擎落地后接线（lead O6 裁决）")
-def test_e2e_apply_stage_wiring_placeholder():
-    """接线清单（task-9 落地后实现）：apply_preset 批式 fan-out（默认批10，args 可调 8~12）；
-    批内逐图结构化失败隔离 + mediapipe timeout 类错误自动重试一次（lead 裁决2）；
-    每图记录链按配方增长、整体生效或整体无痕（事务性）；随后重跑联络表/导出断言修图后状态。"""

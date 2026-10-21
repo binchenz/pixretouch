@@ -243,6 +243,20 @@ def contact_sheet_op(image_ids: list[int] | None = None, thumb: int = 256,
 
 _SAFE_STEM = re.compile(r"[^A-Za-z0-9_.-]+")
 
+_FMT_EXT = {"JPEG": ".jpg", "PNG": ".png", "TIFF": ".tif", "WEBP": ".webp"}
+
+
+def _artifact_ext(p: Path) -> str:
+    """产物扩展名：缓存产物是纯内容寻址哈希名（无扩展名）——按内容格式嗅探。"""
+    from PIL import Image
+
+    try:
+        with Image.open(p) as im:
+            ext = _FMT_EXT.get((im.format or "").upper())
+    except Exception:  # noqa: BLE001
+        ext = None
+    return ext or p.suffix.lower() or ".bin"
+
 
 def export_album_op(image_ids: list[int] | None = None, album_name: str | None = None) -> dict[str, Any]:
     """导出目录：当前态按 {i:03d}_{原stem}{ext} 复制 + manifest.json；默认跳过 reject。"""
@@ -270,7 +284,7 @@ def export_album_op(image_ids: list[int] | None = None, album_name: str | None =
             orig = Path(conn.execute("SELECT path FROM images WHERE id=?", (iid,)).fetchone()["path"])
             seq += 1
             stem = _SAFE_STEM.sub("_", orig.stem) or f"image_{iid}"
-            dest = out_dir / f"{seq:03d}_{stem}{src_p.suffix.lower()}"
+            dest = out_dir / f"{seq:03d}_{stem}{_artifact_ext(src_p)}"
             shutil.copy2(src_p, dest)
             items.append({
                 "file": dest.name, "image_id": iid, "sha256": cur["output_sha256"],
