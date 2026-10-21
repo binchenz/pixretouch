@@ -5,6 +5,7 @@ stdio 传输；stdout 是协议信道，任何日志只走 stderr。
 工具随能力工单逐个挂载：doctor（工单01）、blemish_remove（工单03）、
 assess_image / detect_faces / selection_report（工单04）、
 cluster_faces / list_clusters / rename_cluster / merge_clusters / assign_face（工单05）、
+smooth_skin / whiten_teeth / brighten_eyes（工单06）、
 cutout / bg_replace / bg_blur（工单08）、color_grade（工单09）、
 super_resolve（工单10）。
 挂载模式（后续能力照抄）：from .capabilities import <name> 触发注册副作用，
@@ -28,6 +29,7 @@ from .capabilities import clusters as clusters_cap  # 逻辑主体（工单 05�
 from .capabilities import color as color_cap  # 逻辑主体（工单 09：调色）
 from .capabilities import cutout as cutout_cap  # 逻辑主体（工单 08：主体抠图）
 from .capabilities import inpaint as inpaint_cap  # noqa: F401  能力注册副作用（工单 03）
+from .capabilities import skin as skin_cap  # 逻辑主体（工单 06：磨皮与牙眼）
 from .capabilities import superres as superres_cap  # 逻辑主体（工单 10：超分增强）
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -183,6 +185,54 @@ def assign_face(face_id: int, cluster_id: int | None = None) -> dict[str, Any]:
         成功 {status:"ok", face_id, cluster_id}；失败 {status:"error", error}。
     """
     return clusters_cap.assign_face_op(face_id, cluster_id)
+
+
+@mcp.tool()
+def smooth_skin(image_id: int, cluster_id: int | None = None, strength: float = 0.6) -> dict[str, Any]:
+    """皮肤磨皮（频率分离，保留纹理）：皮肤区域低频均匀化、高频纹理原样保留；追加记录链，可回滚。
+
+    Args:
+        image_id: 库内图像 ID。RGBA 链态只调 RGB、alpha 直通（纪律 8）。
+        cluster_id: 人物聚类 ID（按人寻址）；None = 作用于全图检出人脸。
+        strength: 磨皮强度 (0,1]，默认 0.6。
+
+    Returns:
+        成功 {status:"ok", record_id, output_sha256, output_path, cache_hit,
+        mask_sha256, mask_path}（mask=皮肤权重图）；失败 {status:"error", error}。
+    """
+    return skin_cap.smooth_skin_op(image_id, cluster_id=cluster_id, strength=strength)
+
+
+@mcp.tool()
+def whiten_teeth(image_id: int, cluster_id: int | None = None, amount: float = 0.5) -> dict[str, Any]:
+    """牙齿美白：牙部 mask（唇内缩∩亮低饱和像素）内 HSV 提亮去黄，有上限防假牙感；追加记录链，可回滚。
+
+    Args:
+        image_id: 库内图像 ID。RGBA 链态只调 RGB、alpha 直通（纪律 8）。
+        cluster_id: 人物聚类 ID（按人寻址）；None = 作用于全图检出人脸。
+        amount: 美白强度 (0,1]，默认 0.5。闭嘴照片 mask 近空 → 近恒等输出（记录照常追加）。
+
+    Returns:
+        成功 {status:"ok", record_id, output_sha256, output_path, cache_hit,
+        mask_sha256, mask_path}（mask=牙部权重图）；失败 {status:"error", error}。
+    """
+    return skin_cap.whiten_teeth_op(image_id, cluster_id=cluster_id, amount=amount)
+
+
+@mcp.tool()
+def brighten_eyes(image_id: int, cluster_id: int | None = None, amount: float = 0.35) -> dict[str, Any]:
+    """亮眼：眼部 mask 内暗像素优先提亮（巩膜增白、虹膜瞳孔温和），有上限；追加记录链，可回滚。
+
+    Args:
+        image_id: 库内图像 ID。RGBA 链态只调 RGB、alpha 直通（纪律 8）。
+        cluster_id: 人物聚类 ID（按人寻址）；None = 作用于全图检出人脸。
+        amount: 亮眼强度 (0,1]，默认 0.35。
+
+    Returns:
+        成功 {status:"ok", record_id, output_sha256, output_path, cache_hit,
+        mask_sha256, mask_path}（mask=眼部权重图）；失败 {status:"error", error}。
+    """
+    return skin_cap.brighten_eyes_op(image_id, cluster_id=cluster_id, amount=amount)
 
 
 @mcp.tool()
