@@ -4,6 +4,7 @@ stdio 传输；stdout 是协议信道，任何日志只走 stderr。
 基于 mcp 2.x：from mcp.server import MCPServer（v1 的 mcp.server.fastmcp 已移除）。
 工具随能力工单逐个挂载：doctor（工单01）、blemish_remove（工单03）、
 assess_image / detect_faces / selection_report（工单04）、
+cluster_faces / list_clusters / rename_cluster / merge_clusters / assign_face（工单05）、
 cutout / bg_replace / bg_blur（工单08）、color_grade（工单09）、
 super_resolve（工单10）。
 挂载模式（后续能力照抄）：from .capabilities import <name> 触发注册副作用，
@@ -20,6 +21,7 @@ from mcp.server import MCPServer  # mcp 2.x API（v1 的 mcp.server.fastmcp 已�
 from . import doctor as doctor_mod
 from .capabilities import assess as assess_cap  # 逻辑主体（工单 04：选片质检）
 from .capabilities import background as background_cap  # 逻辑主体（工单 08：背景替换/虚化）
+from .capabilities import clusters as clusters_cap  # 逻辑主体（工单 05：人物聚类与修正）
 from .capabilities import color as color_cap  # 逻辑主体（工单 09：调色）
 from .capabilities import cutout as cutout_cap  # 逻辑主体（工单 08：主体抠图）
 from .capabilities import inpaint as inpaint_cap  # noqa: F401  能力注册副作用（工单 03）
@@ -106,6 +108,78 @@ def selection_report(image_ids: list[int] | None = None) -> dict[str, Any]:
         失败 {status:"error", error}。
     """
     return assess_cap.selection_report_op(image_ids)
+
+
+@mcp.tool()
+def cluster_faces(image_ids: list[int] | None = None) -> dict[str, Any]:
+    """人物聚类：ArcFace 嵌入回填 + 余弦阈值增量聚类（确定性单遍；已分配的脸不动）。
+
+    跨图同一人自动聚成同一人物聚类（按人寻址的寻址单位）；
+    person_type（女/男/童）自动初判，可被 rename_cluster 覆盖。
+
+    Args:
+        image_ids: 参与本次聚类的图像 ID 子集；None = 全库未分配人脸。
+
+    Returns:
+        成功 {status:"ok", backfilled, assigned, created, threshold, clusters}；
+        失败 {status:"error", error}（结构化错误，不抛穿）。
+    """
+    return clusters_cap.cluster_faces_op(image_ids)
+
+
+@mcp.tool()
+def list_clusters() -> dict[str, Any]:
+    """列出人物聚类：id / name / person_type / default_suit_id / face_count / image_ids。
+
+    Returns:
+        成功 {status:"ok", clusters:[...]}；失败 {status:"error", error}。
+    """
+    return clusters_cap.list_clusters_op()
+
+
+@mcp.tool()
+def rename_cluster(cluster_id: int, name: str | None = None, person_type: str | None = None) -> dict[str, Any]:
+    """命名聚类并覆盖 person_type（自动初判的人工覆盖入口；命名后按名字寻址）。
+
+    Args:
+        cluster_id: 目标聚类 ID。
+        name: 聚类名（如「新娘」）；与 person_type 至少给一个。
+        person_type: female / male / child / unknown。
+
+    Returns:
+        成功 {status:"ok", id, name, person_type, default_suit_id}；
+        失败 {status:"error", error}。
+    """
+    return clusters_cap.rename_cluster_op(cluster_id, name=name, person_type=person_type)
+
+
+@mcp.tool()
+def merge_clusters(source_ids: list[int], target_id: int) -> dict[str, Any]:
+    """合并聚类：把被拆散的同一人并入 target；faces 重指、源行删除、默认方案继承。
+
+    Args:
+        source_ids: 被合并的聚类 ID 列表。
+        target_id: 保留的目标聚类 ID。
+
+    Returns:
+        成功 {status:"ok", target_id, merged_sources, faces_moved, default_suit_inherited}；
+        失败 {status:"error", error}。
+    """
+    return clusters_cap.merge_clusters_op(source_ids, target_id)
+
+
+@mcp.tool()
+def assign_face(face_id: int, cluster_id: int | None = None) -> dict[str, Any]:
+    """重指派单张人脸：把误归的脸移入正确聚类；cluster_id=None 移出聚类待重分配。
+
+    Args:
+        face_id: faces 表行 ID。
+        cluster_id: 目标聚类 ID 或 None。
+
+    Returns:
+        成功 {status:"ok", face_id, cluster_id}；失败 {status:"error", error}。
+    """
+    return clusters_cap.assign_face_op(face_id, cluster_id)
 
 
 @mcp.tool()
