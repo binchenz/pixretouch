@@ -8,7 +8,8 @@ cluster_faces / list_clusters / rename_cluster / merge_clusters / assign_face（
 smooth_skin / whiten_teeth / brighten_eyes（工单06）、face_enhance（工单07）、
 cutout / bg_replace / bg_blur（工单08）、color_grade（工单09）、
 super_resolve（工单10）、apply_preset / list_presets / save_preset /
-bind_cluster_suit（工单11）、ingest / ingest_album（工单13 首步提前落）。
+bind_cluster_suit（工单11）、ingest / ingest_album / set_verdicts /
+contact_sheet / export_album（工单13 提前落）。
 挂载模式（后续能力照抄）：from .capabilities import <name> 触发注册副作用，
 @mcp.tool() 只做薄包装，逻辑全部在能力模块的 <tool>_op() 里。
 """
@@ -23,6 +24,7 @@ from typing import Any
 
 from mcp.server import MCPServer  # mcp 2.x API（v1 的 mcp.server.fastmcp 已移除）
 
+from . import album as album_mod  # 逻辑主体（工单 13：相册级 verdict/联络表/导出，非能力）
 from . import doctor as doctor_mod
 from . import intake as intake_mod  # 逻辑主体（工单 13 首步：入库工具，非能力）
 from . import presets as presets_mod  # 逻辑主体（工单 11：预设方案库）
@@ -492,6 +494,56 @@ def ingest_album(directory: str | None = None) -> dict[str, Any]:
         ingested+failed；skipped=非 JPEG/TIFF 候选）；目录不存在 {status:"error", error}。
     """
     return intake_mod.ingest_album_op(directory)
+
+
+@mcp.tool()
+def set_verdicts(items: list[dict[str, Any]], source: str = "human") -> dict[str, Any]:
+    """选片结论覆写/持久化（单一写入口）：verdict 写入 images.meta['verdict']，批量原子。
+
+    Args:
+        items: [{image_id:int, verdict:"keep"|"review"|"reject", reason?:str}, ...]。
+        source: "report"=选片报告落库（workflow S0 段在 selection_report 后调用）；
+            "human"=用户自然语言推翻（默认；spec 用户故事3，agent 解析后调用）。
+        fan-out/联络表/导出一律消费 meta 里的最终值；human 源语义上压过机器判定。
+
+    Returns:
+        成功 {status:"ok", count, updated:[{image_id, verdict}]}；
+        失败 {status:"error", error}（整批无痕回滚，结构化不抛穿）。
+    """
+    return album_mod.set_verdicts_op(items, source=source)
+
+
+@mcp.tool()
+def contact_sheet(image_ids: list[int] | None = None, thumb: int = 256, per_row: int = 6) -> dict[str, Any]:
+    """联络表（三交付物之二，HTML+PNG）：修图前后成对网格；review 打标、reject 单列。
+
+    Args:
+        image_ids: 参与图像；None = 全库。
+        thumb: 缩略图边长 px（64..1024）。
+        per_row: 每行单元格数（1..12）。
+
+    Returns:
+        成功 {status:"ok", cached, sheet_png, index_html, directory,
+        stats:{total, shown, review_marked, rejected_listed}}——幂等：同输入
+        （图集+参数+各图当前态哈希+verdict）返回同一目录；失败 {status:"error", error}。
+    """
+    return album_mod.contact_sheet_op(image_ids, thumb=thumb, per_row=per_row)
+
+
+@mcp.tool()
+def export_album(image_ids: list[int] | None = None, album_name: str | None = None) -> dict[str, Any]:
+    """导出目录（三交付物之三）：当前态产物规整命名复制 + manifest.json；默认跳过 reject。
+
+    Args:
+        image_ids: 导出图像；None = 全库（除 verdict=reject）。
+        album_name: 相册目录名（var/exports/<album_name>/）；None = album_<时间戳>。
+        命名规则 {序号:03d}_{原文件名stem}{ext}；manifest 记 image_id/sha256/链路摘要/verdict。
+
+    Returns:
+        成功 {status:"ok", directory, manifest_path, count, skipped_rejected}；
+        失败 {status:"error", error}。同名相册重导=覆盖刷新。
+    """
+    return album_mod.export_album_op(image_ids, album_name=album_name)
 
 
 def main() -> None:
