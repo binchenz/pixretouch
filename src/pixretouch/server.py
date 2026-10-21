@@ -5,9 +5,9 @@ stdio 传输；stdout 是协议信道，任何日志只走 stderr。
 工具随能力工单逐个挂载：doctor（工单01）、blemish_remove（工单03）、
 assess_image / detect_faces / selection_report（工单04）、
 cluster_faces / list_clusters / rename_cluster / merge_clusters / assign_face（工单05）、
-smooth_skin / whiten_teeth / brighten_eyes（工单06）、
+smooth_skin / whiten_teeth / brighten_eyes（工单06）、face_enhance（工单07）、
 cutout / bg_replace / bg_blur（工单08）、color_grade（工单09）、
-super_resolve（工单10）。
+super_resolve（工单10）、ingest / ingest_album（工单13 首步提前落）。
 挂载模式（后续能力照抄）：from .capabilities import <name> 触发注册副作用，
 @mcp.tool() 只做薄包装，逻辑全部在能力模块的 <tool>_op() 里。
 """
@@ -23,11 +23,13 @@ from typing import Any
 from mcp.server import MCPServer  # mcp 2.x API（v1 的 mcp.server.fastmcp 已移除）
 
 from . import doctor as doctor_mod
+from . import intake as intake_mod  # 逻辑主体（工单 13 首步：入库工具，非能力）
 from .capabilities import assess as assess_cap  # 逻辑主体（工单 04：选片质检）
 from .capabilities import background as background_cap  # 逻辑主体（工单 08：背景替换/虚化）
 from .capabilities import clusters as clusters_cap  # 逻辑主体（工单 05：人物聚类与修正）
 from .capabilities import color as color_cap  # 逻辑主体（工单 09：调色）
 from .capabilities import cutout as cutout_cap  # 逻辑主体（工单 08：主体抠图）
+from .capabilities import face_enhance as face_enhance_cap  # 逻辑主体（工单 07：人脸增强）
 from .capabilities import inpaint as inpaint_cap  # noqa: F401  能力注册副作用（工单 03）
 from .capabilities import skin as skin_cap  # 逻辑主体（工单 06：磨皮与牙眼）
 from .capabilities import superres as superres_cap  # 逻辑主体（工单 10：超分增强）
@@ -236,6 +238,23 @@ def brighten_eyes(image_id: int, cluster_id: int | None = None, amount: float = 
 
 
 @mcp.tool()
+def face_enhance(image_id: int, cluster_id: int | None = None, strength: float = 0.3) -> dict[str, Any]:
+    """人脸增强（CodeFormer）：低清/模糊/老照片人脸修复，输出按强度与原图混合——默认 0.3 保守混合杜绝换脸感；追加记录链，可回滚。
+
+    Args:
+        image_id: 库内图像 ID。RGBA 链态只调 RGB、alpha 直通（纪律 8）。
+        cluster_id: 人物聚类 ID（按人寻址）；None = 作用于全图检出人脸。
+        strength: 混合强度 (0,1]，默认 0.3（保守上限；越高越接近模型全量输出）。
+
+    Returns:
+        成功 {status:"ok", record_id, output_sha256, output_path, cache_hit,
+        mask_sha256, mask_path}（mask=脸部椭圆羽化权重图）；
+        失败 {status:"error", error}（结构化错误，不抛穿）。
+    """
+    return face_enhance_cap.face_enhance_op(image_id, cluster_id=cluster_id, strength=strength)
+
+
+@mcp.tool()
 def cutout(image_id: int) -> dict[str, Any]:
     """主体抠图（ISNet）：产出 alpha 蒙版；记录产物=RGBA PNG，alpha 双登记为独立产物。
 
@@ -378,6 +397,36 @@ def _exit_grace_reaper(grace_s: float = 3.0) -> None:
         os._exit(0)
 
     threading.Thread(target=_reap, daemon=True, name="exit-grace-reaper").start()
+
+
+@mcp.tool()
+def ingest(path: str) -> dict[str, Any]:
+    """单图入库：原图只读登记（哈希+元数据+根记录），幂等（sha256 去重）。
+
+    Args:
+        path: 图像文件路径（绝对，或相对项目根）。一期输入域 JPEG/TIFF。
+
+    Returns:
+        成功 {status:"ok", path, image_id, sha256, duplicate, record_id?}——image_id
+        供全部后续工具寻址；重复入库 duplicate=true 且 image_id 不变；
+        失败 {status:"error", error}（不存在/非 JPEG-TIFF/不可解码，结构化不抛穿）。
+    """
+    return intake_mod.ingest_op(path)
+
+
+@mcp.tool()
+def ingest_album(directory: str | None = None) -> dict[str, Any]:
+    """相册入库：扫描 album-inbox/（或指定目录，递归）逐图入库，失败隔离不阻塞整本。
+
+    Args:
+        directory: 目标目录；None = 项目 album-inbox/ 投递目录。
+
+    Returns:
+        成功 {status:"ok", directory, total, ingested:[{path,image_id,sha256,duplicate}],
+        failed:[{path,error}], skipped:[{path,reason}]}（确定性按路径排序；total=
+        ingested+failed；skipped=非 JPEG/TIFF 候选）；目录不存在 {status:"error", error}。
+    """
+    return intake_mod.ingest_album_op(directory)
 
 
 def main() -> None:
