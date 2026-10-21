@@ -61,12 +61,19 @@ home 层补丁 `~/.dsh/cordis.patch.yml`（优先于 GUI 管理的 profile 层
 
 ## 缓存清理策略
 
-- `var/cache/` = 内容寻址渲染缓存（+`mask:`/`material:` 前缀条目）。**整目录可安全删除**：
-  丢失的只是加速——后续同键调用重渲染重建（原图/记录链/库不受影响）。
+- `var/cache/` = 内容寻址渲染缓存（+`mask:`/`material:` 前缀条目），同时**兼作记录链
+  当前态/中间态产物的存储**——已编辑图的当前版本就存在这里（`records.output_path` 直接
+  指向 cache 文件，`var/renders/` 为空）。
+  - **未编辑图**（当前态=album-inbox 原图）：整目录删除完全安全，后续编辑自动重渲染重建。
+  - **已编辑图**（当前态=渲染产物）：删除后该图**当前版本不可恢复**，后续编辑/导出报
+    `FileNotFoundError`（原图与记录链参数审计仍在，可 `rollback_to` 根记录（原图）后重做，
+    或先 `export_album` 保留成片）。
+  - **安全清理流程**：先把要保留的成片 `export_album` → 再删 `var/cache/`。
+    （口径实测：var/qa/verify_readme_ops.py，case 5）
 - `var/pixretouch.db(+wal/shm)` = 记录链与库，**不可删**（追加式设计 = 审计与回滚的根据）；
   重置库 = 删 db 三件后从 ingest_album 重建（#15 验收开场动作即此）。
 - `var/renders/`、`var/scratch/`、`var/reports/`、`var/exports/` = 派生产物，可删可重生成。
-- `models/` = 权重缓存，可删（prefetch 重拉）；磁盘吃紧时优先清 var/cache，其次 models。
+- `models/` = 权重缓存，可删（prefetch 重拉）；磁盘吃紧时优先按上条安全流程清 var/cache，其次 models。
 
 ## 磁盘预算
 
