@@ -7,7 +7,8 @@ assess_image / detect_faces / selection_report（工单04）、
 cluster_faces / list_clusters / rename_cluster / merge_clusters / assign_face（工单05）、
 smooth_skin / whiten_teeth / brighten_eyes（工单06）、face_enhance（工单07）、
 cutout / bg_replace / bg_blur（工单08）、color_grade（工单09）、
-super_resolve（工单10）、ingest / ingest_album（工单13 首步提前落）。
+super_resolve（工单10）、apply_preset / list_presets / save_preset /
+bind_cluster_suit（工单11）、ingest / ingest_album（工单13 首步提前落）。
 挂载模式（后续能力照抄）：from .capabilities import <name> 触发注册副作用，
 @mcp.tool() 只做薄包装，逻辑全部在能力模块的 <tool>_op() 里。
 """
@@ -24,6 +25,7 @@ from mcp.server import MCPServer  # mcp 2.x API（v1 的 mcp.server.fastmcp 已�
 
 from . import doctor as doctor_mod
 from . import intake as intake_mod  # 逻辑主体（工单 13 首步：入库工具，非能力）
+from . import presets as presets_mod  # 逻辑主体（工单 11：预设方案库）
 from .capabilities import assess as assess_cap  # 逻辑主体（工单 04：选片质检）
 from .capabilities import background as background_cap  # 逻辑主体（工单 08：背景替换/虚化）
 from .capabilities import clusters as clusters_cap  # 逻辑主体（工单 05：人物聚类与修正）
@@ -31,6 +33,7 @@ from .capabilities import color as color_cap  # 逻辑主体（工单 09：调�
 from .capabilities import cutout as cutout_cap  # 逻辑主体（工单 08：主体抠图）
 from .capabilities import face_enhance as face_enhance_cap  # 逻辑主体（工单 07：人脸增强）
 from .capabilities import inpaint as inpaint_cap  # noqa: F401  能力注册副作用（工单 03）
+from .capabilities import preset_engine as preset_cap  # 逻辑主体（工单 11：预设方案事务化编排）
 from .capabilities import skin as skin_cap  # 逻辑主体（工单 06：磨皮与牙眼）
 from .capabilities import superres as superres_cap  # 逻辑主体（工单 10：超分增强）
 
@@ -367,6 +370,68 @@ def super_resolve(image_id: int, scale: int = 4) -> dict[str, Any]:
         守卫：输出边长 >65500（JPEG 上限）或画布 >8GB → 结构化拒绝。
     """
     return superres_cap.super_resolve_op(image_id, scale=scale)
+
+
+@mcp.tool()
+def apply_preset(image_id: int, suit: int | str, cluster_id: int | None = None) -> dict[str, Any]:
+    """套用预设方案（事务化编排）：配方多能力=一段记录链，整体生效或整体无痕；单图事务（批量归 workflow fan-out）。
+
+    图级应用时 person 域步骤按人物聚类自动路由：聚类绑定 default_suit_id 则用绑定方案
+    的 person 域步骤，否则用请求方案；image 域步骤随请求方案全图一次。
+    straight 方案=零步骤基准：输出内容恒等输入。
+
+    Args:
+        image_id: 库内图像 ID。
+        suit: 方案名（取最新版）或 preset_suits.id。
+        cluster_id: 单聚类覆盖应用（只执行该聚类 person 域步骤，image 域跳过）；None=图级。
+
+    Returns:
+        成功 {status:"ok", suit, suit_id, steps, cache_hits, record_ids,
+        output_sha256, output_path, routing, mask_paths}；
+        失败 {status:"error", error}（事务保证零记录残留）。
+    """
+    return preset_cap.apply_preset_op(image_id, suit, cluster_id=cluster_id)
+
+
+@mcp.tool()
+def list_presets() -> dict[str, Any]:
+    """列出预设方案（含 5 套内置种子与自建方案，版本化）。
+
+    Returns:
+        成功 {status:"ok", presets:[{id, name, version, is_builtin, recipe_version,
+        steps:[{capability, params, scope}]}]}；失败 {status:"error", error}。
+    """
+    return presets_mod.list_presets_op()
+
+
+@mcp.tool()
+def save_preset(name: str, steps: list, version: int | None = None) -> dict[str, Any]:
+    """自建预设方案（如「我的韩式哑光」）：入库即可被 apply_preset 消费；同名再存=升版。
+
+    Args:
+        name: 方案名。
+        steps: [{capability, params, scope:"person"|"image"}]——capability 须在能力目录，
+            person 域限 smooth_skin/whiten_teeth/brighten_eyes/face_enhance。
+        version: 缺省=同名最新版+1（版本化追加，旧版不改）。
+
+    Returns:
+        成功 {status:"ok", id, name, version, steps}；失败 {status:"error", error}。
+    """
+    return presets_mod.save_preset_op(name, steps, version=version)
+
+
+@mcp.tool()
+def bind_cluster_suit(cluster_id: int, suit_id: int | None = None) -> dict[str, Any]:
+    """把人物聚类绑定到默认预设方案（None=解绑）；图级 apply_preset 按人路由的依据。
+
+    Args:
+        cluster_id: 人物聚类 ID。
+        suit_id: preset_suits.id 或 None。
+
+    Returns:
+        成功 {status:"ok", cluster_id, default_suit_id}；失败 {status:"error", error}。
+    """
+    return presets_mod.bind_cluster_suit_op(cluster_id, suit_id)
 
 
 def _exit_grace_reaper(grace_s: float = 3.0) -> None:
