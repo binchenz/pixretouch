@@ -9,7 +9,7 @@ smooth_skin / whiten_teeth / brighten_eyes（工单06）、face_enhance（工单
 cutout / bg_replace / bg_blur（工单08）、color_grade（工单09）、
 super_resolve（工单10）、apply_preset / list_presets / save_preset /
 bind_cluster_suit（工单11）、ingest / ingest_album / set_verdicts /
-contact_sheet / export_album（工单13 提前落）。
+contact_sheet / export_album（工单13 提前落）、rollback_to / history（工单12 质检回路补挂）。
 挂载模式（后续能力照抄）：from .capabilities import <name> 触发注册副作用，
 @mcp.tool() 只做薄包装，逻辑全部在能力模块的 <tool>_op() 里。
 """
@@ -25,6 +25,7 @@ from typing import Any
 from mcp.server import MCPServer  # mcp 2.x API（v1 的 mcp.server.fastmcp 已移除）
 
 from . import album as album_mod  # 逻辑主体（工单 13：相册级 verdict/联络表/导出，非能力）
+from . import chainops as chainops_mod  # 逻辑主体（记录链查询/回退，工单 12 质检回路补挂）
 from . import doctor as doctor_mod
 from . import intake as intake_mod  # 逻辑主体（工单 13 首步：入库工具，非能力）
 from . import presets as presets_mod  # 逻辑主体（工单 11：预设方案库）
@@ -434,6 +435,41 @@ def bind_cluster_suit(cluster_id: int, suit_id: int | None = None) -> dict[str, 
         成功 {status:"ok", cluster_id, default_suit_id}；失败 {status:"error", error}。
     """
     return presets_mod.bind_cluster_suit_op(cluster_id, suit_id)
+
+
+@mcp.tool()
+def history(image_id: int) -> dict[str, Any]:
+    """记录链查询：根 → 当前态的有序记录（capability/params/产物哈希/cluster_id/时间）。
+
+    质检回路处置路径第一步：定位要回退到的记录。
+
+    Args:
+        image_id: 库内图像 ID。
+
+    Returns:
+        成功 {status:"ok", image_id, current_record_id, records:[{id, parent_id,
+        capability, params, output_sha256, cluster_id, created_at}]}；
+        失败 {status:"error", error}。
+    """
+    return chainops_mod.history_op(image_id)
+
+
+@mcp.tool()
+def rollback_to(image_id: int, record_id: int) -> dict[str, Any]:
+    """回滚 = 移动当前态指针到目标记录（记录链只追加不删除，目标必须属于同一图像）。
+
+    用途：修图复检不过/伪影 → 回退到出问题记录之前 → 换参重做（skill 质检回路）；
+    联络表淘汰单张重修（workflow 检查点 3）。回退后同参重调会因链态复原而缓存命中。
+
+    Args:
+        image_id: 库内图像 ID。
+        record_id: 目标记录 ID（history 查得）。
+
+    Returns:
+        成功 {status:"ok", image_id, current:{id, capability, params, output_sha256,
+        output_path, cluster_id}}；失败 {status:"error", error}（含归属校验）。
+    """
+    return chainops_mod.rollback_to_op(image_id, record_id)
 
 
 def _exit_grace_reaper(grace_s: float = 3.0) -> None:
