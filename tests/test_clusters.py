@@ -225,6 +225,11 @@ def test_cluster_row_fields_and_override(isolated_home):
         assert set(cl) >= {"id", "name", "person_type", "default_suit_id", "face_count", "image_ids"}
         assert cl["person_type"] in C.PERSON_TYPES
         assert cl["default_suit_id"] is None          # 预设方案工单 11 才绑定
+        # F8：faces 明细与 face_count 一致，字段可供聚类核验/按位置兜底命名
+        assert len(cl["faces"]) == cl["face_count"]
+        for fd in cl["faces"]:
+            assert {"face_id", "image_id", "bbox", "quality"} <= set(fd)
+            assert len(fd["bbox"]) == 4 and all(isinstance(v, int) for v in fd["bbox"])
     # genderage 初判生效： Apollo 11 机组（男性成人）应判 male，而非 unknown
     crew_cids = set(_face_clusters(conn, gid).values())
     crew_types = {cl["person_type"] for cl in listing if cl["id"] in crew_cids}

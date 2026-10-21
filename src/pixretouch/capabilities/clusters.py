@@ -374,6 +374,16 @@ def list_clusters(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     for r in rows:
         d = dict(r)
         d["image_ids"] = [int(v) for v in d["image_ids"].split(",")] if d["image_ids"] else []
+        # F8（#13 盲测摩擦项）：每聚类 face 明细（face_id/image_id/bbox/quality）——
+        # 聚类正确性核验（不必肉眼数人头）、按位置兜底命名（左/中/右）、#15 聚类
+        # 审计的第一手数据。additive 兼容：既有键与语义不变。
+        face_rows = conn.execute(
+            "SELECT id, image_id, bbox, quality FROM faces WHERE cluster_id=? ORDER BY image_id, id",
+            (r["id"],),
+        ).fetchall()
+        d["faces"] = [{"face_id": f["id"], "image_id": f["image_id"],
+                       "bbox": json.loads(f["bbox"]), "quality": f["quality"]}
+                      for f in face_rows]
         out.append(d)
     return out
 

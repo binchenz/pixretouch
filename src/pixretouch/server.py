@@ -142,10 +142,12 @@ def cluster_faces(image_ids: list[int] | None = None) -> dict[str, Any]:
 
 @mcp.tool()
 def list_clusters() -> dict[str, Any]:
-    """列出人物聚类：id / name / person_type / default_suit_id / face_count / image_ids。
+    """列出人物聚类：id / name / person_type / default_suit_id / face_count / image_ids / faces 明细。
 
     Returns:
-        成功 {status:"ok", clusters:[...]}；失败 {status:"error", error}。
+        成功 {status:"ok", clusters:[{id, name, person_type, default_suit_id,
+        face_count, image_ids, faces:[{face_id, image_id, bbox, quality}]}]}；
+        失败 {status:"error", error}。faces 明细供聚类正确性核验与按位置兜底命名。
     """
     return clusters_cap.list_clusters_op()
 
