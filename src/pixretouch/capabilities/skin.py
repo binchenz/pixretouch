@@ -53,7 +53,7 @@ LEFT_BROW = [300, 293, 334, 296, 336, 285, 295, 282, 283, 276]
 LIPS_OUTER = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269,
               267, 0, 37, 39, 40, 185]
 
-MASK_KINDS = ("skin", "teeth", "eyes")
+MASK_KINDS = ("skin", "teeth", "eyes", "face_oval")
 
 
 # ------------------------------------------------------------------ mask 构建
@@ -69,11 +69,12 @@ def build_face_mask(
     faces_landmarks: Sequence[Sequence[tuple[float, float]]],
     img_bgr: Any | None = None,
 ) -> Any:
-    """kind ∈ {skin, teeth, eyes}：多脸合成权重 mask（float32 (h,w) ∈[0,1]）。
+    """kind ∈ {skin, teeth, eyes, face_oval}：多脸合成权重 mask（float32 (h,w) ∈[0,1]）。
 
     每脸以自有尺度（脸宽）确定膨胀/羽化半径——分辨率无关；多脸取逐像素 max。
     teeth 需要像素信息（亮低饱和选择），传 img_bgr；闭嘴时 mask 近空 →
-    渲染近恒等（记录照常追加，语义诚实）。
+    渲染近恒等（记录照常追加，语义诚实）。face_oval = 整脸椭圆羽化
+    （工单 07 人脸增强的混合权重图；不扣五官）。
     """
     import cv2
     import numpy as np
@@ -107,6 +108,11 @@ def build_face_mask(
             k = max(3, int(face_w * 0.03) | 1)
             region = cv2.dilate(region, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
             m = cv2.GaussianBlur(region.astype(np.float32) / 255.0, (0, 0), max(1.0, face_w * 0.012))
+
+        elif kind == "face_oval":
+            region = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(region, [_pts(pts_l, FACE_OVAL)], 255)
+            m = cv2.GaussianBlur(region.astype(np.float32) / 255.0, (0, 0), max(1.0, face_w * 0.02))
 
         else:  # teeth
             lips = np.zeros((h, w), dtype=np.uint8)
