@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -318,3 +319,72 @@ def test_cluster_override_addressing_error(isolated_home):
     r = PE.apply_preset_op(g, "natural", cluster_id=cid)
     assert r["status"] == "error" and "ValueError" in r["error"]
     assert _caps(conn, g) == ["base"], "寻址失败必须零痕迹（事务性）"
+
+
+# ------------------------------------------------------------------ lut_path 素材规则（issue #16 回归）
+def _write_gamma2_cube(path: Path, n: int = 8) -> Path:
+    """gamma2 压暗 cube（out=v²）：LUT_3D_SIZE n + n³ 行，red 变化最快（.cube 标准）。"""
+    step = 1.0 / (n - 1)
+    lines = ['TITLE "gamma2-darken"', f"LUT_3D_SIZE {n}"]
+    for b in range(n):
+        for g in range(n):
+            for r in range(n):
+                lines.append(f"{(r * step) ** 2:.6f} {(g * step) ** 2:.6f} {(b * step) ** 2:.6f}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+@needs_fixtures
+def test_lut_path_recipe_material_rule(isolated_home):
+    """#16 回归：外部 .cube 走素材规则真支持——内容 sha 进 params/缓存键、路径不进键、
+    像素级实际生效（qa 实证静默丢弃时 vs 对照 diff=0.00）、素材固化可取回。"""
+    import numpy as np
+    from PIL import Image
+
+    cube = _write_gamma2_cube(isolated_home / "gamma2.cube")
+    conn, ing = _ingest(FIXTURES / "portrait-01-frontal-clear.jpg")
+    img = ing["image_id"]
+
+    saved = presets.save_preset_op("darken-lut", [
+        {"capability": "color_grade", "params": {"lut_path": str(cube)}, "scope": "image"},
+    ])
+    assert saved["status"] == "ok", saved
+
+    r = PE.apply_preset_op(img, "darken-lut")
+    assert r["status"] == "ok" and r["steps"] == 1, r
+
+    # 素材规则：params 记内容 sha、路径不进键
+    row = conn.execute("SELECT params FROM records WHERE image_id=? ORDER BY id DESC LIMIT 1",
+                       (img,)).fetchone()
+    p = json.loads(row["params"])
+    assert "lut_path" not in p, "路径不进缓存键/记录"
+    assert isinstance(p["lut"], dict) and len(p["lut"]["sha256"]) == 64 and p["lut"]["name"] is None
+
+    # 像素级生效：gamma2 压暗 → 全图均值显著下降（静默丢弃时代的 diff=0.00 不复存在）
+    with Image.open(FIXTURES / "portrait-01-frontal-clear.jpg") as im:
+        orig = np.asarray(im.convert("RGB")).astype(float)
+    with Image.open(r["output_path"]) as im:
+        out = np.asarray(im.convert("RGB")).astype(float)
+    assert out.mean() < orig.mean() - 10.0, f"gamma2 压暗应实际生效: {orig.mean():.1f} -> {out.mean():.1f}"
+
+    # 素材固化进内容寻址存储（正规取用路径 path_for(sha) 可取回）
+    from pixretouch import engine
+    _c, cache = engine.get_session()
+    assert cache.get(f"material:{p['lut']['sha256']}") is not None
+
+    # fail-fast：lut 与 lut_path 互斥（save 期结构化拒绝）
+    bad = presets.save_preset_op("bad-lut", [
+        {"capability": "color_grade",
+         "params": {"lut": "bw-classic", "lut_path": str(cube)}, "scope": "image"},
+    ])
+    assert bad["status"] == "error" and "ValueError" in bad["error"] and "二选一" in bad["error"]
+
+    # 不存在的 lut_path：save 期只查结构（通过），apply 期结构化错误 + 零记录残留
+    ghost = presets.save_preset_op("ghost-lut", [
+        {"capability": "color_grade",
+         "params": {"lut_path": str(isolated_home / "nope.cube")}, "scope": "image"},
+    ])
+    assert ghost["status"] == "ok"
+    r2 = PE.apply_preset_op(img, "ghost-lut")
+    assert r2["status"] == "error" and "不存在" in r2["error"]
+    assert _caps(conn, img) == ["base", "color_grade"], "失败路径零记录残留（事务性）"

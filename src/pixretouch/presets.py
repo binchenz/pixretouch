@@ -105,6 +105,15 @@ def validate_steps(steps: Any) -> list[dict[str, Any]]:
         params = st.get("params", {})
         if not isinstance(params, dict):
             raise ValueError(f"steps[{i}]: params 必须是对象")
+        if cap == "color_grade":
+            # LUT 参数 fail-fast（issue #16：不支持的形态在入库时响亮拒绝，不静默丢弃）
+            lut, lut_path = params.get("lut"), params.get("lut_path")
+            if lut is not None and lut_path is not None:
+                raise ValueError(f"steps[{i}]: lut（内置名）与 lut_path（外部文件）二选一")
+            if lut is not None and not isinstance(lut, str):
+                raise ValueError(f"steps[{i}]: lut 须为内置 LUT 名字符串，收到 {lut!r}")
+            if lut_path is not None and not isinstance(lut_path, str):
+                raise ValueError(f"steps[{i}]: lut_path 须为路径字符串，收到 {lut_path!r}")
         out.append({"capability": cap, "params": params, "scope": scope})
     return out
 

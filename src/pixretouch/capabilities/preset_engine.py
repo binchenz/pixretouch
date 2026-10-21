@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .. import data, presets
+from .. import config, data, presets
 from ..engine import EngineContext, get_context, get_session, png_sha256
 from . import CAPABILITIES, load_all
 from . import face_enhance as fe_infra
@@ -105,11 +105,12 @@ def _person_step(step: dict, cid: int | None, rows: list[dict], size: tuple[int,
 def _prepare_step(capability: str, params: dict, cache: data.ContentCache) -> tuple[dict, dict]:
     """工具级配方参数 → 渲染级规范形（素材规则，模式 docstring 纪律 7）。
 
-    配方以工具级友好形式存储（如 {"lut": "bw-classic"}），引擎负责下降：
-    内置 LUT 名 → {"name", "sha256"}（内容 sha 进 params/缓存键，路径不进键）、
+    配方以工具级友好形式存储（{"lut": "bw-classic"} 或 {"lut_path": "..."}），
+    引擎负责下降：LUT（内置名或外部 .cube）→ {"name", "sha256"}（内容 sha 进
+    params/缓存键，路径不进键——issue #16 修复：lut_path 曾被静默丢弃）、
     素材 cache.put("material:"+sha) 固化、payload 预解析省算（重建路径 =
-    ctx.cache.path_for(sha)，与 color_grade_op 行为逐位一致 → 缓存键互通，
-    预设与单能力直调共享渲染缓存）。person 域能力现无素材类参数，直通。
+    ctx.cache.path_for(sha)，与 color_grade_op 行为逐位一致）。
+    person 域能力现无素材类参数，直通。
     """
     params = dict(params)
     payload: dict[str, Any] = {}
@@ -117,7 +118,22 @@ def _prepare_step(capability: str, params: dict, cache: data.ContentCache) -> tu
         from . import color as color_cap
 
         lut = params.get("lut")
-        if isinstance(lut, str):
+        lut_path = params.pop("lut_path", None)   # 路径本身永不进键（素材规则）
+        if lut is not None and lut_path is not None:
+            raise ValueError("lut（内置名）与 lut_path（外部文件）二选一")
+        if lut_path is not None:
+            # 外部 .cube 按素材规则真支持（issue #16：不允许静默丢弃）：
+            # 内容 sha256 进 params/缓存键、素材 cache.put 固化、payload 预解析
+            p = Path(str(lut_path)).expanduser()
+            if not p.is_absolute():
+                p = config.PROJECT_HOME / p
+            if not p.exists():
+                raise ValueError(f"lut_path 不存在：{p}")
+            sha = data.file_sha256(p)
+            cache.put(f"material:{sha}", p)
+            payload["lut"] = color_cap.parse_cube(p)   # fail-fast：格式错误在计划期结构化抛出
+            params["lut"] = {"name": None, "sha256": sha}
+        elif isinstance(lut, str):
             src = color_cap.builtin_lut_path(lut)
             ref = {"name": lut, "sha256": data.file_sha256(src)}
             cache.put(f"material:{ref['sha256']}", src)
