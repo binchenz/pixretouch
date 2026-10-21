@@ -306,9 +306,89 @@ def test_faces_persist_and_roundtrip(isolated_home):
         x, y, w, h = r["bbox"]
         assert w > 0 and h > 0 and x >= 0 and y >= 0
 
-    # 重跑 → 覆盖式写入，行数不翻倍
+    # 重跑 → 对账式写入（issue #17）：命中行原地更新，行数不翻倍
     A.detect_faces_op(img)
     assert len(F.load_faces(conn, img)) == 3
+
+
+# ------------------------------------------------------------------ faces 对账（issue #17 归属迁移，无模型）
+def _cluster_row(conn, name: str | None = None) -> int:
+    cur = conn.execute("INSERT INTO clusters(name, person_type, created_at) VALUES(?,?,?)",
+                       (name, "unknown", "t"))
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def _insert_face_row(conn, image_id: int, bbox, cluster_id: int | None) -> int:
+    return int(conn.execute(
+        "INSERT INTO faces(image_id, cluster_id, bbox, landmark, quality, detected_at)"
+        " VALUES(?,?,?,?,?,?)",
+        (image_id, cluster_id, json.dumps(list(bbox)), json.dumps([]), 0.9, "t")).lastrowid)
+
+
+def _face(bbox, quality: float = 0.8) -> F.Face:
+    return F.Face(bbox=tuple(bbox), quality=quality, landmarks=[], ear_left=0.3, ear_right=0.3)
+
+
+def test_persist_faces_reconciles_in_place_and_keeps_links(conn, tmp_path):
+    """#17 根因回归（无模型）：覆写改对账——重复检出的脸原地 UPDATE（face_id /
+    cluster_id 保留），新脸 INSERT 留 NULL 交增量聚类，消失的脸 DELETE 但留审计。"""
+    img = data.ingest(conn, _noise_jpeg(tmp_path / "recon.jpg", w=200, h=200))["image_id"]
+    cid = _cluster_row(conn, "主角")
+    old_a = _insert_face_row(conn, img, (10, 10, 40, 40), cid)
+    old_b = _insert_face_row(conn, img, (100, 100, 40, 40), None)
+
+    audit = F.persist_faces(conn, img, [_face((12, 12, 40, 40)), _face((120, 120, 30, 30))])
+    assert audit["updated"] == 1 and audit["inserted"] == 1
+    assert audit["deleted_face_ids"] == [old_b], "消失的脸必须删除且留审计（不静默）"
+    assert audit["links_inherited"] == 1 and audit["matched_via"]["iou"] == 1
+
+    rows = {r["face_id"]: r for r in F.load_faces(conn, img)}
+    assert len(rows) == 2 and old_a in rows and old_b not in rows
+    assert rows[old_a]["cluster_id"] == cid, "命中旧行必须原地保留聚类归属"
+    assert rows[old_a]["bbox"] == (12, 12, 40, 40) and rows[old_a]["quality"] == 0.8, \
+        "原地更新：bbox/quality 刷新到本次检出"
+    fresh = [r for fid, r in rows.items() if fid != old_a]
+    assert len(fresh) == 1 and fresh[0]["cluster_id"] is None, \
+        "新脸留 NULL，交给增量聚类（cluster_faces 只处理未分配脸）"
+
+    # 检测集无实质变化 → 零 INSERT/DELETE，face_id 稳定（lead 裁决③ in-place 语义）
+    before_ids = set(rows)
+    audit2 = F.persist_faces(conn, img, [_face((12, 12, 40, 40)), _face((120, 120, 30, 30))])
+    assert audit2["updated"] == 2 and audit2["inserted"] == 0 and audit2["deleted_face_ids"] == []
+    assert set(r["face_id"] for r in F.load_faces(conn, img)) == before_ids
+
+
+def test_persist_faces_preserves_links_across_scale(conn, tmp_path):
+    """#17 lead 硬要求：super_resolve 尺寸翻倍后复检——归属迁移必须用**归一化**
+    坐标（绝对坐标 IoU 会失配）；且超分尺度上再次复检、以及回滚回原尺度复检，
+    两个方向都必须保留 cluster_id。"""
+    img = data.ingest(conn, _noise_jpeg(tmp_path / "scale.jpg", w=320, h=240))["image_id"]
+    cid = _cluster_row(conn, "主角")
+    old_a = _insert_face_row(conn, img, (40, 30, 40, 50), cid)
+    old_b = _insert_face_row(conn, img, (200, 100, 50, 60), cid)
+    scaled = [_face((80, 60, 80, 100)), _face((400, 200, 100, 120))]
+
+    # super_resolve ×2 后首次 assess 复检：旧行在原图坐标，新检在 2x 画布
+    audit = F.persist_faces(conn, img, scaled, canvas=(640, 480))
+    assert audit["updated"] == 2 and audit["inserted"] == 0
+    assert audit["deleted_face_ids"] == [] and audit["links_inherited"] == 2
+    rows = {r["face_id"]: r for r in F.load_faces(conn, img)}
+    assert set(rows) == {old_a, old_b}
+    assert all(r["cluster_id"] == cid for r in rows.values())
+    assert rows[old_a]["bbox"] == (80, 60, 80, 100), "命中行坐标刷新到 2x 画布坐标系"
+
+    # 2x 尺度上再次复检：旧行已是 2x 坐标（images.width 仍是原图 320）→ 仍需保留
+    audit2 = F.persist_faces(conn, img, scaled, canvas=(640, 480))
+    assert audit2["updated"] == 2 and audit2["links_inherited"] == 2
+    assert audit2["deleted_face_ids"] == [] and audit2["inserted"] == 0
+
+    # 回滚回原图尺度再复检（旧行 2x 坐标 → 新检原图坐标）：反向尺度同样保留
+    original = [_face((40, 30, 40, 50)), _face((200, 100, 50, 60))]
+    audit3 = F.persist_faces(conn, img, original, canvas=(320, 240))
+    assert audit3["updated"] == 2 and audit3["links_inherited"] == 2
+    assert {r["face_id"]: r["cluster_id"] for r in F.load_faces(conn, img)} == \
+        {old_a: cid, old_b: cid}
 
 
 @needs_models
@@ -342,9 +422,13 @@ def test_mini_album_verdicts(isolated_home):
 # ------------------------------------------------------------------ 推理容器（issue #5 A 类挂起回归）
 @needs_models
 @needs_fixtures
-def test_detect_retries_once_on_inference_timeout(monkeypatch):
+def test_detect_retries_once_on_inference_timeout(isolated_home, monkeypatch):
     """产品契约（issue #5，任务板 task-10/11）：容器超时 → 新代际自动重试一次；
-    二次仍超时才上抛；重试恰好一次不多试。"""
+    二次仍超时才上抛；重试恰好一次不多试。
+
+    isolated_home 是必要隔离：MODELS_DIR 必须指向仓库 models/（本模块纪律「真实
+    权重跨测试共享，零网络」）——否则本测试会走网络下载模型，门禁随网络抖动。
+    """
     calls = {"n": 0}
 
     def flaky(fn, *args):

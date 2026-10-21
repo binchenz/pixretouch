@@ -87,6 +87,18 @@ def test_e2e_album_pipeline_skeleton(isolated_home):
     cl = server.cluster_faces(None)
     assert cl["status"] == "ok", cl
 
+    # faces 归属基线（#17 教训：此前终态只断言 clusters 行数、未查 faces.cluster_id
+    # 链接完整性，导致「质检复检清零归属」漏网；以下为终态「行数+链接」双断言的基线）
+    face_links_after_cluster = {
+        iid: [(r["id"], r["cluster_id"]) for r in conn.execute(
+            "SELECT id, cluster_id FROM faces WHERE image_id=? ORDER BY id", (iid,))]
+        for iid in ids
+    }
+    n_faces_after_cluster = sum(len(v) for v in face_links_after_cluster.values())
+    assert n_faces_after_cluster > 0
+    assert all(cid is not None for v in face_links_after_cluster.values() for _, cid in v), \
+        "S1 聚类后 faces 必须全部链接（faces.cluster_id 非空）"
+
     # ---- S2 批量套用（接线 dev-b c79c73a 契约：suit 按名、事务化单图、
     #      apply→assess 成对复检硬规则；lead 裁决2 策略镜像：timeout 类自动重试
     #      一次再隔离，其余错误直接隔离——与 workflows/album-apply.js 同一策略）----
@@ -190,6 +202,25 @@ def test_e2e_album_pipeline_skeleton(isolated_home):
     ).fetchone()["c"]
     assert n_verdict == n_images, "verdict 全量持久化在 images.meta"
     assert conn.execute("SELECT COUNT(*) c FROM clusters").fetchone()["c"] >= 1
+
+    # ---- faces 归属完整性（#17 漏网面：行数+链接双断言）----
+    # 本次缺陷能进 e2e 未被捕获，正因为终态只数 faces/clusters 行数、不看链接：
+    # assess 复检把 cluster_id 全部清零后，行数依旧。此处以 S1 聚类后基线对账：
+    # 每张图的 face_id 集合不得漂移（复检不得重建行）、cluster_id 归属逐脸不变。
+    n_faces = conn.execute("SELECT COUNT(*) c FROM faces").fetchone()["c"]
+    n_linked = conn.execute(
+        "SELECT COUNT(*) c FROM faces WHERE cluster_id IS NOT NULL").fetchone()["c"]
+    assert n_faces == n_faces_after_cluster, \
+        "终态 faces 行数必须与 S1 聚类后一致（复检不得增删行）"
+    assert n_linked == n_faces, \
+        "终态 faces 必须全部保有聚类归属——#17 漏网面（apply→assess 复检不得清零）"
+    for iid, before_links in face_links_after_cluster.items():
+        now = {r["id"]: r["cluster_id"] for r in conn.execute(
+            "SELECT id, cluster_id FROM faces WHERE image_id=?", (iid,))}
+        assert set(now) == {fid for fid, _ in before_links}, \
+            f"图像 {iid}：faces 行被重建（face_id 漂移 = 归属迁移失败）"
+        assert now == dict(before_links), \
+            f"图像 {iid}：复检后 cluster_id 归属必须保持"
 
 
 @pytest.mark.skipif(not FIXTURES.is_dir(), reason="qa mini-album fixture 缺失")

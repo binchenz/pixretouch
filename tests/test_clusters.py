@@ -8,6 +8,9 @@
 - 嵌入持久化与幂等 → test_embeddings_persisted_and_idempotent
 - op 结构化错误 → test_cluster_op_structured_errors（无模型依赖）
 - kps 派生/person_type 规则 → 单元级（无模型依赖）
+- faces 归属迁移（#17）：质检复检/重检后 cluster_id 保持 →
+  test_assess_and_detect_preserve_cluster_links（repro 原形）+
+  test_addressing_survives_apply_and_reassess（apply→P1 复检→按人寻址）
 
 纪律（铁律 8 + 工单 03 范本）：主接缝 = op 函数；isolated_home 隔离库/缓存，
 MODELS_DIR 共享仓库真实权重（零网络）；单人照用「从已提交 group-01 fixture 现场
@@ -24,6 +27,8 @@ from pixretouch import data
 from pixretouch.capabilities import assess as A
 from pixretouch.capabilities import clusters as C
 from pixretouch.capabilities import faces as F
+from pixretouch.capabilities import preset_engine as PE
+from pixretouch.capabilities import skin as S
 
 REPO = Path(__file__).resolve().parents[1]
 FIXTURES = REPO / "tests" / "fixtures" / "mini-album"
@@ -293,3 +298,65 @@ def test_four_correction_tools(isolated_home):
     assert r["status"] == "ok" and r["created"] <= 1  # 至多为 assign None 的那张脸新建
     # 幂等护栏：merge 不存在的聚类 → 结构化错误
     assert C.merge_clusters_op([999999], dst)["status"] == "error"
+
+
+# ------------------------------------------------------------------ faces 归属迁移（issue #17）
+def _links(conn, image_id: int) -> dict[int, int | None]:
+    rows = conn.execute("SELECT id, cluster_id FROM faces WHERE image_id=? ORDER BY id",
+                        (image_id,)).fetchall()
+    return {r["id"]: r["cluster_id"] for r in rows}
+
+
+@needs_models
+@needs_fixtures
+def test_assess_and_detect_preserve_cluster_links(isolated_home):
+    """#17 最小复现原形（qa var/qa/repro_faces_wipe.py）：detect → cluster_faces
+    （3 聚类、3 脸全链接）→ assess_image 复检（skill 质检回路 P1 同款调用）→
+    链接保持；再 detect_faces（刷新路径）→ 仍保持。修复前两条路径都清零 linked。"""
+    conn, gid, crop_ids, p1, p2 = _scenario(isolated_home)
+    assert C.cluster_faces_op()["status"] == "ok"
+    before = _links(conn, gid)
+    assert len(before) == 3 and all(c is not None for c in before.values()), \
+        "聚类后合影三脸应全部链接"
+
+    a = A.assess_image_op(gid)
+    assert a["status"] == "ok"
+    assert a["assess"]["faces_audit"]["links_inherited"] == 3
+    assert _links(conn, gid) == before, \
+        "assess 复检不得重建行：face_id 与 cluster_id 归属都必须保持"
+
+    d = A.detect_faces_op(gid)
+    assert d["status"] == "ok" and d["face_count"] == 3
+    assert d["faces_audit"]["deleted_face_ids"] == []
+    assert _links(conn, gid) == before, \
+        "detect_faces 刷新不得清除聚类归属"
+
+    listing = {cl["id"]: cl for cl in C.list_clusters_op()["clusters"]}
+    for cid in set(before.values()):
+        assert listing[cid]["face_count"] >= 1, "聚类不得因复检成为空壳"
+
+
+@needs_models
+@needs_fixtures
+def test_addressing_survives_apply_and_reassess(isolated_home):
+    """#17 影响面回归：cluster → apply_preset（person 域按聚类路由）→ 修图后
+    P1 复检（skill 硬规则）→ 按人寻址仍生效（target_faces 命中同一批脸 +
+    按人渲染落 records.cluster_id）。"""
+    conn, gid, crop_ids, p1, p2 = _scenario(isolated_home)
+    assert C.cluster_faces_op()["status"] == "ok"
+    before = _links(conn, gid)
+    target_cid = sorted(c for c in before.values() if c is not None)[0]
+    target_fids = sorted(fid for fid, c in before.items() if c == target_cid)
+
+    r = PE.apply_preset_op(gid, "natural")
+    assert r["status"] == "ok", r
+    assert A.assess_image_op(gid)["status"] == "ok"   # 修图后必复检（硬规则）
+    assert _links(conn, gid) == before, "apply→assess 后归属必须保持（#17 核心影响面）"
+
+    rows = S.target_faces(conn, gid, target_cid)
+    assert sorted(x["face_id"] for x in rows) == target_fids, "按人寻址仍命中同一批脸"
+    sr = S.smooth_skin_op(gid, cluster_id=target_cid)
+    assert sr["status"] == "ok", sr
+    rec = conn.execute("SELECT cluster_id FROM records WHERE id=?",
+                       (sr["record_id"],)).fetchone()
+    assert rec["cluster_id"] == target_cid, "按人寻址必须落 records.cluster_id 专列"

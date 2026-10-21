@@ -5,6 +5,11 @@
 消费方：人物聚类（工单 05，faces.embedding 列已预留）、磨皮与牙眼 / 人脸增强
 （工单 06/07，按人寻址）。
 
+持久化（faces 表）是对账式写入（issue #17）：重检按归一化 bbox IoU（覆盖
+super_resolve 尺度翻倍/回滚）+ ArcFace 嵌入最近邻兜底迁移 **cluster_id 归属**，
+检测集无实质变化时原地更新、不重建行——skill 质检回路「修图后必复检」因此不再
+摧毁按人寻址状态；未匹配新脸留 NULL 交增量聚类，消失的脸删除并留审计。
+
 选型结论（工单 04 评估，已记 issue #5）：
 - mediapipe 1.1.1：py3.11/arm64 可装、与 numpy 2.4.6 共存；仅 Tasks API
   （legacy solutions 已在 1.x 移除），wheel 零内置模型。本单采用
@@ -439,25 +444,222 @@ def detect(image_path: Path, max_faces: int = 8) -> list[Face]:
         return _INFERENCE.call(_detect_job, rgb_arr, max_faces, det_model, lmk_model)
 
 
-# ------------------------------------------------------------------ 持久化
-def persist_faces(conn: sqlite3.Connection, image_id: int, faces: Sequence[Face]) -> int:
-    """覆盖式写入 faces 表（DELETE + INSERT），返回行数。
+# ------------------------------------------------------------------ 持久化（对账式，issue #17）
+IOU_MATCH_THRESHOLD = 0.4    # 归一化 bbox IoU 匹配下限（同尺度重检 ≈1.0，超分归一后 ≈0.9+）
+EMB_MATCH_COSINE = 0.42      # 嵌入最近邻兜底阈值（与 clusters.COSINE_THRESHOLD 同源同值）
+# 修图能力链上唯一会改画布尺寸的是 super_resolve（×2/×4，可链式）→ 旧 faces 行的
+# 检出画布必为「images 原图尺寸 × 2^k」。对账时对旧行逐一试算这些画布假设取最大
+# IoU：既覆盖「原图旧行 + 超分后新检」，也覆盖「超分后旧行 + 回滚/再次复检」——
+# 二者都只有归一化坐标能匹配（绝对坐标会因尺度翻倍而失配，lead 硬要求）。
+MAX_CANVAS_SCALE_EXP = 4
 
-    landmark 以扁平 JSON 存 [x0,y0,x1,y1,...]（478 点 → 956 个数）。
-    注意（工单 05 消费前必读）：重检出会清空本图旧行及其 cluster_id 关联；
-    聚类落地后如需保留关联，由聚类工单负责合并策略。
+
+def image_canvas(image_path: Path) -> tuple[int, int]:
+    """图像文件当前画布尺寸 (w, h)（不解码像素；持久化对账的坐标归一基准）。"""
+    from PIL import Image
+
+    with Image.open(image_path) as im:
+        return int(im.width), int(im.height)
+
+
+def _old_canvas_hypotheses(old_ref: tuple[int, int],
+                           current: tuple[int, int]) -> list[tuple[int, int]]:
+    """旧 faces 行可能的检出画布集合（确定性枚举，供归一化 IoU 试算）。"""
+    out: list[tuple[int, int]] = []
+    w, h = int(old_ref[0] or 0), int(old_ref[1] or 0)
+    if w > 0 and h > 0:
+        out = [(w << k, h << k) for k in range(MAX_CANVAS_SCALE_EXP + 1)]
+    if current not in out:
+        out.append(current)
+    return out
+
+
+def _pair_iou(old_bbox, old_canvases: Sequence[tuple[int, int]],
+              new_bbox, new_canvas: tuple[int, int]) -> float:
+    """跨画布尺度的归一化 IoU：对旧行画布假设取最大值（尺度不变匹配核心）。"""
+    return max(_norm_iou(old_bbox, oc, new_bbox, new_canvas) for oc in old_canvases)
+
+
+def _arcface_embedding_available() -> bool:
+    """本地是否已有 ArcFace 权重：评估复检是分析型路径，不得被动触发模型下载。"""
+    from .. import config
+    from . import WEIGHT_SPECS
+
+    try:
+        from . import clusters  # noqa: F401  触发 weight("arcface_w600k_r50") 注册
+    except Exception:  # noqa: BLE001  insightface 缺装等 → 兜底层不可用
+        return False
+    spec = WEIGHT_SPECS.get("arcface_w600k_r50")
+    if not spec:
+        return False
+    return (Path(config.MODELS_DIR) / "arcface_w600k_r50" / spec["file"]).exists()
+
+
+def _norm_iou(old_bbox, old_ref: tuple[int, int], new_bbox, new_size: tuple[int, int]) -> float:
+    """两代 bbox 各按自身画布归一到相对坐标后的 IoU。
+
+    old_ref = 旧行检出时的候选画布（见 _old_canvas_hypotheses——super_resolve
+    尺度翻倍/回滚场景由多假设试算覆盖）；new_size = 本次检出画布。
     """
+    ow, oh = max(old_ref[0], 1), max(old_ref[1], 1)
+    nw, nh = max(new_size[0], 1), max(new_size[1], 1)
+    ax0, ay0 = old_bbox[0] / ow, old_bbox[1] / oh
+    ax1, ay1 = (old_bbox[0] + old_bbox[2]) / ow, (old_bbox[1] + old_bbox[3]) / oh
+    bx0, by0 = new_bbox[0] / nw, new_bbox[1] / nh
+    bx1, by1 = (new_bbox[0] + new_bbox[2]) / nw, (new_bbox[1] + new_bbox[3]) / nh
+    ix = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    iy = max(0.0, min(ay1, by1) - max(ay0, by0))
+    inter = ix * iy
+    union = (ax1 - ax0) * (ay1 - ay0) + (bx1 - bx0) * (by1 - by0) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def persist_faces(
+    conn: sqlite3.Connection,
+    image_id: int,
+    faces: Sequence[Face],
+    *,
+    canvas: tuple[int, int] | None = None,
+    image_path: Path | None = None,
+    image_bgr: Any | None = None,
+) -> dict[str, Any]:
+    """对账式写入 faces 表（issue #17 修复：覆盖式重建曾清除 cluster_id 归属，
+    使 skill 质检回路的每次复检都摧毁按人寻址状态）。
+
+    匹配语义（确定性，两级）：
+    ① 归一化 bbox IoU ≥ IOU_MATCH_THRESHOLD：旧 bbox 按其检出画布候选（原图 ×
+       2^k，见 _old_canvas_hypotheses）逐一归一、新 bbox 按本次画布归一，取最大
+       IoU；全部候选对按分数降序贪心配对（同分按旧行 id、新脸序号破平）。
+       super_resolve 尺度翻倍/回滚两种方向均由此覆盖（绝对坐标必失配，lead 硬要求）。
+    ② ①未配的新脸做 ArcFace 嵌入最近邻兜底：与未配旧行的既有嵌入余弦
+       ≥ EMB_MATCH_COSINE（尺度不变；需 image_path/image_bgr 且本地已有权重，
+       缺失时本层跳过并告警——不因分析型复检被动触发模型下载）。
+    匹配上 → 原地 UPDATE 旧行（**face_id / cluster_id / embedding 全保留**，刷新
+    bbox/landmark/quality/detected_at）——检测集无实质变化时零 INSERT/DELETE
+    （lead 裁决③的 in-place 语义由此天然达成）；
+    未匹配新脸 → INSERT（cluster_id/embedding NULL，交给增量聚类——cluster_faces
+    本就只处理未分配脸，正好咬合）；
+    未匹配旧行（消失的脸，如修补删掉的路人）→ DELETE + 审计痕迹（log.warning +
+    返回 deleted_face_ids，不静默）。
+
+    embedding 保留口径：ArcFace 对齐裁剪尺度不变、修图仅轻度改变观感，旧嵌入
+    仍是有效身份信号（聚类质心消费不变）；身份级错误由 assign_face 人工修正优先。
+    canvas = 本次检出画布 (w,h)，缺省时从 image_path 读、再缺省回退 images 原图尺寸；
+    image_path 供画布读取与②层懒加载，image_bgr 为调用方已解码时的直供捷径。
+
+    返回审计 dict：{total, updated, inserted, deleted_face_ids, links_inherited,
+    canvas, matched_via: {"iou": n, "embedding": m}}。
+    """
+    import numpy as np
+
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    conn.execute("DELETE FROM faces WHERE image_id=?", (image_id,))
-    for f in faces:
+    img_row = conn.execute("SELECT width, height FROM images WHERE id=?", (image_id,)).fetchone()
+    old_ref = ((img_row["width"] or 0), (img_row["height"] or 0)) if img_row else (0, 0)
+    if canvas is None and image_path is not None:
+        try:
+            canvas = image_canvas(Path(image_path))
+        except Exception as e:  # noqa: BLE001  画布不可读不阻塞对账（回退 images 原图尺寸）
+            log.warning("faces 对账：读画布尺寸失败（%s: %s），回退 images 原图尺寸",
+                        type(e).__name__, e)
+    if canvas is not None and int(canvas[0]) > 0 and int(canvas[1]) > 0:
+        current_canvas = (int(canvas[0]), int(canvas[1]))
+    elif old_ref[0] > 0 and old_ref[1] > 0:
+        current_canvas = old_ref
+    else:
+        current_canvas = (1, 1)   # 退化：画布不可知时按原始像素坐标归一（同尺度假设）
+    old_canvases = _old_canvas_hypotheses(old_ref, current_canvas)
+    old_rows = conn.execute(
+        "SELECT id, cluster_id, bbox, embedding FROM faces WHERE image_id=? ORDER BY id",
+        (image_id,)).fetchall()
+
+    # ① 归一化 IoU 贪心配对
+    pairs: list[tuple[float, int, int]] = []
+    for ni, f in enumerate(faces):
+        for oj, r in enumerate(old_rows):
+            iou = _pair_iou(json.loads(r["bbox"]), old_canvases, f.bbox, current_canvas)
+            if iou >= IOU_MATCH_THRESHOLD:
+                pairs.append((-iou, oj, ni))
+    pairs.sort()
+    match: dict[int, tuple[int, str]] = {}
+    used_old: set[int] = set()
+    for _neg, oj, ni in pairs:
+        if ni in match or oj in used_old:
+            continue
+        match[ni] = (oj, "iou")
+        used_old.add(oj)
+
+    # ② 嵌入最近邻兜底（懒导入 clusters 防循环；模型/嵌入缺失时本层跳过并告警）
+    unmatched_new = [ni for ni in range(len(faces)) if ni not in match]
+    unmatched_old = [oj for oj in range(len(old_rows)) if oj not in used_old]
+    if unmatched_new and unmatched_old and \
+            any(old_rows[oj]["embedding"] for oj in unmatched_old):
+        try:
+            if not _arcface_embedding_available():
+                log.warning("faces 对账：%s 张脸 IoU 未匹配且 ArcFace 权重不在本地，"
+                            "跳过嵌入兜底（未匹配旧行将删除、新脸留 NULL 待增量聚类）",
+                            len(unmatched_new))
+            else:
+                from . import clusters as _cl
+
+                bgr = image_bgr
+                if bgr is None and image_path is not None:
+                    import cv2
+
+                    bgr = cv2.imread(str(Path(image_path)), cv2.IMREAD_COLOR)
+                if bgr is not None:
+                    cands: list[tuple[float, int, int]] = []
+                    for ni in unmatched_new:
+                        try:
+                            e = _cl.embed_face(bgr, faces[ni].landmarks)
+                        except Exception:  # noqa: BLE001  单脸嵌入失败隔离（留给增量聚类）
+                            continue
+                        for oj in unmatched_old:
+                            blob = old_rows[oj]["embedding"]
+                            if not blob:
+                                continue
+                            sim = float(np.dot(e, np.frombuffer(blob, dtype=np.float32)))
+                            if sim >= EMB_MATCH_COSINE:
+                                cands.append((-sim, oj, ni))
+                    cands.sort()
+                    for _neg, oj, ni in cands:
+                        if ni in match or oj in used_old:
+                            continue
+                        match[ni] = (oj, "embedding")
+                        used_old.add(oj)
+        except Exception as e:  # noqa: BLE001  兜底层整体不可用不阻塞①层结果
+            log.warning("faces 对账嵌入兜底不可用（%s: %s）", type(e).__name__, e)
+
+    # 落库：matched UPDATE / 新脸 INSERT / 消失脸 DELETE+审计
+    via_count = {"iou": 0, "embedding": 0}
+    updated = inserted = links = 0
+    for ni, f in enumerate(faces):
+        bbox_json = json.dumps(list(f.bbox))
+        lm_json = json.dumps([c for p in f.landmarks for c in p])
+        if ni in match:
+            oj, via = match[ni]
+            old = old_rows[oj]
+            conn.execute(
+                "UPDATE faces SET bbox=?, landmark=?, quality=?, detected_at=? WHERE id=?",
+                (bbox_json, lm_json, f.quality, now, old["id"]))
+            updated += 1
+            via_count[via] += 1
+            if old["cluster_id"] is not None:
+                links += 1
+        else:
+            conn.execute(
+                "INSERT INTO faces(image_id, bbox, landmark, quality, detected_at) VALUES(?,?,?,?,?)",
+                (image_id, bbox_json, lm_json, f.quality, now))
+            inserted += 1
+    deleted_ids = [old_rows[oj]["id"] for oj in range(len(old_rows)) if oj not in used_old]
+    if deleted_ids:
         conn.execute(
-            "INSERT INTO faces(image_id, bbox, landmark, quality, detected_at) VALUES(?,?,?,?,?)",
-            (image_id, json.dumps(list(f.bbox)),
-             json.dumps([c for p in f.landmarks for c in p]),
-             f.quality, now),
-        )
+            f"DELETE FROM faces WHERE id IN ({','.join('?' * len(deleted_ids))})", deleted_ids)
+        log.warning("faces 对账：图像 %s 移除 %s 个消失人脸行（审计 id: %s）",
+                    image_id, len(deleted_ids), deleted_ids)
     conn.commit()
-    return len(faces)
+    return {"total": len(faces), "updated": updated, "inserted": inserted,
+            "deleted_face_ids": deleted_ids, "links_inherited": links,
+            "canvas": list(current_canvas), "matched_via": via_count}
 
 
 def load_faces(conn: sqlite3.Connection, image_id: int) -> list[dict[str, Any]]:

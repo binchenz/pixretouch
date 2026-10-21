@@ -151,7 +151,9 @@ def target_faces(conn, image_id: int, cluster_id: int | None) -> list[dict]:
     if not rows:
         cur = data.get_current(conn, image_id)
         detected = faces_infra.detect(Path(cur["output_path"]))
-        faces_infra.persist_faces(conn, image_id, detected)
+        # 对账式持久化（issue #17）：自动重检出不得清除既有聚类归属
+        faces_infra.persist_faces(conn, image_id, detected,
+                                  image_path=Path(cur["output_path"]))
         rows = faces_infra.load_faces(conn, image_id)
     if cluster_id is not None:
         rows = [r for r in rows if r["cluster_id"] == int(cluster_id)]

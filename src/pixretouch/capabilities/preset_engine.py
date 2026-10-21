@@ -173,7 +173,9 @@ def build_plan(conn: sqlite3.Connection, cache: data.ContentCache, image_id: int
             rows_all = faces_infra.load_faces(conn, image_id)
             if not rows_all:
                 detected = faces_infra.detect(Path(cur["output_path"]))
-                faces_infra.persist_faces(conn, image_id, detected)
+                # 对账式持久化（issue #17）：复用既有行，保留聚类归属
+                faces_infra.persist_faces(
+                    conn, image_id, detected, image_path=Path(cur["output_path"]))
                 rows_all = faces_infra.load_faces(conn, image_id)
             if not rows_all:
                 person_skipped = "未检出人脸——person 域步骤跳过（image 域照常执行）"

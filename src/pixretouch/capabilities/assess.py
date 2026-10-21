@@ -119,7 +119,10 @@ def assess_image(
     result: dict[str, Any] = {**dims, "face_detection": detect_faces}
     if detect_faces:
         detected = faces_mod.detect(path, max_faces=max_faces)
-        faces_mod.persist_faces(conn, image_id, detected)
+        # 对账式落库（issue #17）：保留 face_id / cluster_id 归属，复检不摧毁按人寻址
+        face_audit = faces_mod.persist_faces(
+            conn, image_id, detected,
+            canvas=(dims["width"], dims["height"]), image_path=path)
         img_area = max(1, dims["width"] * dims["height"])
         max_area = max((f.bbox[2] * f.bbox[3] for f in detected), default=0)
         max_face_side = max((min(f.bbox[2], f.bbox[3]) for f in detected), default=0)
@@ -136,6 +139,8 @@ def assess_image(
             "eyes_closed": any(f.eyes_closed() for f in detected),
             "wink": any(f.wink() for f in detected),
             "ear_threshold": faces_mod.EAR_CLOSED_THRESHOLD,
+            # 归属迁移审计（issue #17）：消失/新增的脸不静默，agent 可据此判断
+            "faces_audit": face_audit,
         })
     result["assessed_at"] = _now()
 
@@ -311,14 +316,19 @@ def assess_image_op(image_id: int) -> dict[str, Any]:
 
 
 def detect_faces_op(image_id: int) -> dict[str, Any]:
-    """detect_faces 工具实现：重检人脸+landmark 并覆盖写 faces 表（供聚类前刷新）。"""
+    """detect_faces 工具实现：重检人脸+landmark 并对账写 faces 表（供聚类前刷新）。
+
+    对账语义（issue #17）：命中的旧行原地更新 → cluster_id / embedding / face_id
+    保留；结果附 faces_audit（updated/inserted/deleted_face_ids/links_inherited）。
+    """
     conn, _cache = get_session()
     try:
         cur = data.get_current(conn, int(image_id))
         detected = faces_mod.detect(Path(cur["output_path"]))
-        n = faces_mod.persist_faces(conn, image_id, detected)
-        return {"status": "ok", "image_id": image_id, "face_count": n,
-                "faces": [f.summary() for f in detected]}
+        audit = faces_mod.persist_faces(
+            conn, image_id, detected, image_path=Path(cur["output_path"]))
+        return {"status": "ok", "image_id": image_id, "face_count": len(detected),
+                "faces": [f.summary() for f in detected], "faces_audit": audit}
     except Exception as e:  # noqa: BLE001
         log.exception("detect_faces(image_id=%s) 失败", image_id)
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
