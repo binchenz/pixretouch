@@ -13,7 +13,10 @@ super_resolve（工单10）。
 from __future__ import annotations
 
 import logging
+import os
 import sys
+import threading
+import time
 from typing import Any
 
 from mcp.server import MCPServer  # mcp 2.x API（v1 的 mcp.server.fastmcp 已移除）
@@ -297,9 +300,41 @@ def super_resolve(image_id: int, scale: int = 4) -> dict[str, Any]:
     return superres_cap.super_resolve_op(image_id, scale=scale)
 
 
+def _exit_grace_reaper(grace_s: float = 3.0) -> None:
+    """进程生命周期兜底（B 类挂起防护；lead 裁决 2026-10-21，案卷见 issue #5 评论）。
+
+    背景：DSH 运维刷新（touch cordis.patch.yml 触发重组重连）以 stdin EOF 方式淘汰旧
+    server；若解释器内残留第三方原生非 daemon 线程（历史案例：mediapipe
+    SerialDispatcher executor 卡 atexit join——已由 f2ac6f2 容器化根治，实测 assess×3
+    后 EOF 0.5s 自退 rc=0），正常退出会被卡住，留下孤儿进程持有模型内存。
+    兜底：宽限期后仍未退出 → stderr flush + os._exit(0)。
+
+    设计取舍（勿试图「改进」为独立 stdin 监视线程）：
+    - stdout/stdin 是 MCP 协议信道，**不可双读**（会偷协议字节）——mcp.run() 返回
+      就是唯一安全的 EOF 信号，本函数只在 run() 返回后启动计时；
+    - DB 安全：data.apply/assess/clusters 每操作同步 commit，静止态无未决写事务；
+      WAL 语义下未回放日志由下次打开自动恢复（工单02 崩溃恢复已测）→ os._exit 无
+      数据风险；
+    - 正常路径零影响：reaper 是 daemon 线程，解释器自然退出时随之消失。
+    """
+
+    def _reap() -> None:
+        time.sleep(grace_s)
+        log.warning("传输已关闭但解释器 %ss 未退出（第三方原生线程滞留？）——os._exit(0) 兜底", grace_s)
+        try:
+            logging.shutdown()  # stderr flush
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(0)
+
+    threading.Thread(target=_reap, daemon=True, name="exit-grace-reaper").start()
+
+
 def main() -> None:
     log.info("pixretouch server starting (stdio)")
     mcp.run()
+    # run() 返回 = stdin EOF / 传输层关闭 → 退出路径；挂兜底防第三方线程卡死退出
+    _exit_grace_reaper()
 
 
 if __name__ == "__main__":
