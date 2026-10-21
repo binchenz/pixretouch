@@ -190,3 +190,72 @@ def test_e2e_album_pipeline_skeleton(isolated_home):
     ).fetchone()["c"]
     assert n_verdict == n_images, "verdict 全量持久化在 images.meta"
     assert conn.execute("SELECT COUNT(*) c FROM clusters").fetchone()["c"] >= 1
+
+
+@pytest.mark.skipif(not FIXTURES.is_dir(), reason="qa mini-album fixture 缺失")
+def test_timeout_resolve_by_db(isolated_home, tmp_path):
+    """P3 处置分支（lead 硬约束2：超时≠失败≠回滚）——慢渲染 monkeypatch 用例。
+
+    镜像 workflows/album-*.js 的 P3 硬规则：client 超时放弃等待后，server 侧孤儿
+    渲染仍会完成并单事务落库；处置必须「查库定论」（history 链已增长=已套用，
+    计入成功且**禁止重跑**——防双倍渲染+双份记录），而非当失败直接重试。
+    """
+    import threading
+    import time
+
+    import numpy as np
+    from PIL import Image
+
+    from pixretouch import data, engine, server
+    from pixretouch.capabilities import preset_engine as preset_cap
+
+    p = tmp_path / "slow.jpg"
+    rng = np.random.default_rng(5)
+    Image.fromarray(rng.integers(0, 255, (96, 128, 3), dtype=np.uint8)).save(p, "JPEG")
+    r_ing = server.ingest(str(p))
+    assert r_ing["status"] == "ok", r_ing
+    img_id = r_ing["image_id"]
+    conn, _cache = engine.get_session()
+
+    # 纯 image 域自建方案（噪声图无人脸行，person 域步骤会结构化报错——真实流程
+    # 选片段已自动补测人脸，此处聚焦 P3 处置分支本身）
+    sp = server.save_preset("e2e-timeout-probe", [
+        {"capability": "color_grade", "params": {"temperature": 5}, "scope": "image"},
+    ])
+    assert sp["status"] == "ok", sp
+
+    calls = {"n": 0}
+    real_op = preset_cap.apply_preset_op
+
+    def slow_op(image_id, suit, cluster_id=None):
+        calls["n"] += 1
+        time.sleep(1.5)  # 模拟慢渲染：client 已超时放弃，server 仍在渲染
+        return real_op(image_id, suit, cluster_id=cluster_id)
+
+    def resolve_by_db(image_id: int, len_before: int, deadline_s: float = 8.0) -> dict:
+        """P3 镜像 helper：查库定论（链增长=已提交成功；宽限内未增长才可安全重跑）。"""
+        t0 = time.time()
+        while time.time() - t0 < deadline_s:
+            if len(data.history(conn, image_id)) > len_before:
+                return {"status": "ok", "resolved": "db-committed"}
+            time.sleep(0.3)
+        return {"status": "timeout_uncommitted", "resolved": "safe-to-retry"}
+
+    preset_cap.apply_preset_op = slow_op
+    th = None
+    try:
+        len_before = len(data.history(conn, img_id))
+        # 模拟 client 超时：后台线程发起真实调用（server 侧继续），主流程提前放弃等待
+        th = threading.Thread(target=lambda: server.apply_preset(img_id, "e2e-timeout-probe"), daemon=True)
+        th.start()
+        time.sleep(0.4)  # client 超时点（渲染远未完成）
+
+        res = resolve_by_db(img_id, len_before)  # 查库定论（孤儿渲染 ~1.5s 后单事务落库）
+        assert res == {"status": "ok", "resolved": "db-committed"}, res
+        assert calls["n"] == 1, "查库定论成功后禁止重跑（防双倍渲染+双份记录）"
+        hist = data.history(conn, img_id)
+        assert len(hist) > len_before and hist[-1]["capability"] != "base"
+    finally:
+        preset_cap.apply_preset_op = real_op
+        if th is not None:
+            th.join(15)
