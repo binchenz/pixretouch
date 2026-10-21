@@ -220,6 +220,9 @@ class _InferenceGeneration:
     def request_shutdown(self) -> None:
         self._q.put(None)
 
+    def thread_join(self, timeout: float) -> None:
+        self._thread.join(timeout=timeout)
+
 
 class _FaceInference:
     """模块级单例（纪律 9 话语体系）：代际计数器 + 当代引用 + 创建锁。"""
@@ -252,12 +255,19 @@ class _FaceInference:
                 f"当代句柄已弃置，重试本调用即自动重建"
             ) from None
 
-    def shutdown(self) -> None:
-        """优雅关闭当代（测试钩子；ADR-0003 常驻进程正常不调用）。"""
+    def shutdown(self, timeout: float = 15.0) -> None:
+        """优雅关闭当代并同步等待 owner 退出（测试钩子；ADR-0003 常驻进程正常不调用）。
+
+        同步 join 杜绝解释器退出期 mediapipe 句柄 GC __del__ 在 concurrent.futures
+        全局 shutdown 之后触发 close 的噪声（Exception ignored: cannot schedule
+        new futures after shutdown）。正常路径 owner 秒级退出；仅当代健康时调用，
+        卡死代际走毒化路径而非本函数。
+        """
         with self._lock:
             gen, self._gen = self._gen, None
         if gen is not None:
             gen.request_shutdown()
+            gen.thread_join(timeout)
 
 
 _INFERENCE = _FaceInference()
