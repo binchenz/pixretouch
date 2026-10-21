@@ -14,8 +14,16 @@ description: PixRetouch 修图决策树——用 pixretouch MCP 工具修人像�
 2. **记录链语义**：原图永远只读；每个修图调用 = 在记录链上追加一条记录，当前态指针定义
    生效状态。推论：同参数重复调用会叠加两次效果——调整效果的正确动作是回退后重调，
    或换参数在新链态上重调。
-3. **词汇**：记录链 / 当前态指针 / 预设方案 / 按人寻址 / 人物聚类 / 选片 / 联络表 / 检查点
-   以仓库 `GLOSSARY.md` 为准。
+3. **词汇自足定义**（与仓库 GLOSSARY.md 同义；本文自足，不依赖任何外部文件）：
+   - **记录链**：单图追加式编辑序列，每条记录=能力+参数+前驱；修图即追加，永不改原图。
+   - **当前态指针**：指向当前生效记录的引用；回滚=移动指针，不删记录。
+   - **预设方案**：命名、可版本化的能力参数组合，可整体套用到一张图或一个人。
+   - **人物聚类**：人脸相似度自动聚合的「同一个人」样本组，按人寻址的寻址单位。
+   - **按人寻址**：参数以人物聚类为单位定向应用——同一张合影不同人各持参数组。
+   - **选片**：相册自动质量评估（清晰度/曝光/闭眼/人脸可检出）并产出取舍报告。
+   - **联络表**：修图前后成对对比的网格图，验收交付物之一。
+   - **检查点**：批量流程中的人工确认节点（取舍/命名与配方案/成片终审）。
+   - **一发模式**：跳过全部检查点、端到端全自动的批量模式。
 
 ## 主干流程
 
@@ -30,8 +38,12 @@ description: PixRetouch 修图决策树——用 pixretouch MCP 工具修人像�
 4. **执行修图**：按定好的路线调用；多人照片的每个人差异化参数用 `cluster_id` 按人寻址。
    → 每次调用返回 ok 且拿到 `output_path`（当前态产物）。
 5. **质检回路**：每次修图后立即复检（硬规则，见专节）。→ 复检通过，或已按失败路径处置完毕。
-6. **交付**：向用户报告当前态产物路径、做了什么（用记录链的 capability 序列说话）、复检结论。
-   整本相册的出片交付走「板块五 · 批量与 workflow」。
+6. **交付**：向用户报告做了什么（用记录链的 capability 序列说话）、复检结论、产物路径。
+   注意 `output_path` 是**内容寻址缓存文件，无扩展名**（形如 var/cache/xx/yy/<sha256>；
+   内容为 JPEG 或 PNG，按文件头判别：前 8 字节为 PNG 魔数则是 PNG，否则 JPEG）。
+   单图规范交付约定：复制并重命名为 `<原名 stem>-retouched.<jpg|png>`（扩展名按上述
+   嗅探），复制后以 sha256 与当前态记录核对一致，把副本路径给用户；相册批量交付走
+   `export_album`（板块五）。
 
 ## 板块一 · 任务→能力映射
 
@@ -59,7 +71,12 @@ description: PixRetouch 修图决策树——用 pixretouch MCP 工具修人像�
 
 ## 板块二 · 照片类型→参数起点
 
-判定信号全部来自步骤 2 的 assess 维度，不要裸猜：
+判定信号全部来自步骤 2 的 assess 维度，不要裸猜。
+**类型可叠加，处理优先级固定：先抢救、再精修、最后统调**——
+① 抢救段（逆光/暗光/低分辨率多病共存时，按 逆光→暗光→低分辨率 取主矛盾做一个抢救段）；
+② 人像精修段（磨皮/牙/眼/人脸修复）；③ 全局影调（`color_grade` 永远收尾）。
+「合影」是结构不是类型：先走合影支线定结构（聚类+寻址），每个人的段内按 ①→②→③ 叠加。
+组合示例（合影+逆光）：支线聚类 → 逐聚类 `face_enhance` 轻抢救 → 图级 `color_grade` 提曝收尾。
 
 **单人像**（face_count=1，max_face_side≥110）
 - 标准三件：`smooth_skin(0.4~0.6)` → `brighten_eyes(0.25~0.35)` → 露齿加 `whiten_teeth(0.4~0.5)`。
@@ -91,18 +108,29 @@ description: PixRetouch 修图决策树——用 pixretouch MCP 工具修人像�
 
 ### 合影支线（按人寻址）
 
-1. `cluster_faces()` → 跨图同一人自动聚成人物聚类（增量、幂等，重跑不动已分配的脸）。
-2. `list_clusters()` → 看聚类与 face_count；`rename_cluster(cluster_id, name="新娘")` 命名，
-   person_type（female/male/child）自动初判不准就在这里覆盖。
+1. `cluster_faces(image_ids=[本图 image_id])` → 人物聚类。**单张修图必传 image_ids
+   收窄到本图**（缺省 = 全库未分配人脸，会把库里其他照片卷进来）；相册批量才传整批
+   或缺省。image_id 一律取自本次会话 `ingest` 的返回值，不假设库里已有旧 id。
+   聚类增量、幂等：重跑不动已分配的脸。
+2. `list_clusters()` → 核对聚类正确性：face_count 应等于图中人数；faces 明细
+   （face_id/image_id/bbox/quality）对照原图逐脸核验（bbox 位置对得上人头）。
+   **命名可选**：用户给了身份（「新娘」）→ `rename_cluster(cluster_id, name="新娘")`；
+   没给身份可以不命名，直接用 cluster_id 走完全程；需要人类可读指代时按 faces 明细的
+   bbox x 坐标从左到右兜底命名（「左一」「中」「右一」），或用 person_type（「男士1」）。
+   person_type（female/male/child）自动初判不准就在 rename_cluster 覆盖。
 3. 聚类错了：同一人被拆散 → `merge_clusters(source_ids, target_id)`；误归的脸 →
    `assign_face(face_id, cluster_id)`；漏检的脸先 `detect_faces(image_id)` 再重聚类。
-4. 差异化修图，三选一：
-   - 全图统一套系：`apply_preset(image_id, suit)`（图级）。
+4. 差异化修图。**默认分支（用户没提任何按人差异化诉求）：图级统一套系
+   `apply_preset(image_id, suit)`——最常见路径；已绑定方案的聚类自动按人路由。**
+   用户提出差异化时才升级：
    - 单人特判（「这张里的孩子磨皮轻一点」）：`smooth_skin(image_id, cluster_id=孩子, strength=0.3)`
      或 `apply_preset(image_id, suit, cluster_id=...)`（只跑该聚类的人像步骤）。
    - 固定风格跟人走：`bind_cluster_suit(cluster_id, suit_id)` 后图级 `apply_preset`——
-     绑定者自动用自己的方案（按人路由），未绑定者用请求方案。
-5. 合影闭眼判读：`assess.faces[].eyes_closed` 按脸看——合影总有人眨眼，整图 reject 不适用；
+     绑定者自动用自己的方案，未绑定者用请求方案。
+5. 露齿补白：natural 等套系不一定含牙段——某聚类的脸露齿笑（看原图或产物）→
+   `whiten_teeth(image_id, cluster_id=该聚类, amount=0.4~0.5)` 补一步（editorial 已含
+   牙段无需补）。对闭嘴脸调用无害：mask 近空 → 近恒等，只多一条记录。
+6. 合影闭眼判读：`assess.faces[].eyes_closed` 按脸看——合影总有人眨眼，整图 reject 不适用；
    同场景多张时用逐脸 EAR 挑全员睁眼的那张。
 
 ## 板块三 · 预设方案选择规则
@@ -110,12 +138,12 @@ description: PixRetouch 修图决策树——用 pixretouch MCP 工具修人像�
 预设方案 = 命名的、可版本化的能力参数组合，`apply_preset` 事务性套用（整套生效或整套无痕，
 失败可安全重试）。内置 5 套（`list_presets()` 查完整配方）：
 
-| 方案 | 内容概要 | 用它的时机 |
+| 方案 | 配方（person 段 + image 段，数值=当前 v1，与 list_presets() 同步、冲突以工具返回为准） | 用它的时机 |
 |---|---|---|
-| `natural` | 磨皮 0.4 + 亮眼 0.25 + 轻暖调 | **日常默认**；拿不准就它 |
-| `editorial` | 人脸修复 0.25 + 磨皮 0.55 + 牙 0.4 + 对比冷调 | 成片感/杂志感交付 |
-| `bw-classic` | 磨皮 0.4 + 经典黑白 LUT | 黑白基准配方 |
-| `rescue` | 人脸修复 0.5 + 磨皮 + 亮眼 + 自动白平衡 + 提曝 0.5 | 逆光/暗光/废片抢救 |
+| `natural` | smooth_skin 0.4 + brighten_eyes 0.25 ＋ color_grade(temperature=4, exposure=0.1) | **日常默认**；拿不准就它 |
+| `editorial` | face_enhance 0.25 + smooth_skin 0.55 + whiten_teeth 0.4 ＋ color_grade(contrast=18, temperature=-4) | 成片感/杂志感交付 |
+| `bw-classic` | smooth_skin 0.4 ＋ color_grade(lut="bw-classic") | 黑白基准配方 |
+| `rescue` | face_enhance 0.5 + smooth_skin 0.5 + brighten_eyes 0.3 ＋ color_grade(wb_auto=true, exposure=0.5) | 逆光/暗光/废片抢救 |
 | `straight` | 零步骤 | 对照基准：输出恒等输入；验证引擎无损；用户要求原样 |
 
 选择规则（判定分支，对号即走）：
@@ -130,6 +158,13 @@ description: PixRetouch 修图决策树——用 pixretouch MCP 工具修人像�
   apply 默认取最新版。
 - 套系里的步骤是链上一段连续记录：单步不满意不必推翻整套——回退到套系前记录，
   改用单能力手工组合。
+- 无人脸的图（风景/静物混入相册）：含 person 步骤的方案照常可用——person 段自动跳过、
+  image 段照常执行（返回体带 `person_skipped` 审计字段），无需为风景图换方案。
+- 自建配方的两层校验口径：`save_preset` 只做结构校验（能力在册 / scope 合法 / person
+  白名单 / LUT 参数互斥）；数值语义边界由单能力工具层把守——自建配方里的越界数值
+  （如 strength>1）apply 时不响亮失败，渲染层会裁剪或恒等降级。写配方对照板块一参数域自查。
+- 外部 LUT 进配方：params 写 `{"lut_path": "<绝对或相对项目根的 .cube 路径>"}`——引擎按
+  素材规则下降为内容 sha256（路径不进缓存键；文件须在 apply 时存在，格式错误当场结构化报错）。
 
 ## 板块四 · 质检回路（硬规则）
 
