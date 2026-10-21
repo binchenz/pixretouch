@@ -69,6 +69,15 @@ RIGHT_EYE = (33, 160, 158, 133, 153, 144)    # 图像左侧眼（主体右眼）
 LEFT_EYE = (362, 385, 387, 263, 373, 380)    # 图像右侧眼（主体左眼）
 
 EAR_CLOSED_THRESHOLD = 0.15   # 双眼 EAR 均低于此 → 闭眼。
+
+
+class InferenceTimeout(RuntimeError):
+    """推理容器超时（当代句柄已毒化，下次调用自愈重建）。
+
+    产品契约（lead 裁决 2026-10-21，issue #5 / 任务板 task-10、task-11）：
+    调用路径遇本异常应**重试一次**（新代际）再向上报真错；detect() 已内建
+    该契约，上层消费方（assess/聚类/后续能力）无需重复处理。
+    """
 # 验收 fixture 实测校准（issue #5）：睁眼正例 0.19~0.37、闭眼负例 0.015~0.022，
 # 0.15 两侧余量 ≥0.04；skill 决策树（工单 12）引用此经验起点。
 
@@ -249,7 +258,7 @@ class _FaceInference:
                     self._gen = None
             log.error("mediapipe 推理超时（>%.0fs, gen=%s）：当代句柄已弃置，下次调用自动重建",
                       timeout, gen.gen_id)
-            raise RuntimeError(
+            raise InferenceTimeout(
                 f"mediapipe inference timeout (>{timeout:.0f}s, gen={gen.gen_id}): "
                 f"疑似绑定层丢失唤醒（SerialDispatcher future 永不完成，见 issue #5）；"
                 f"当代句柄已弃置，重试本调用即自动重建"
@@ -422,7 +431,12 @@ def detect(image_path: Path, max_faces: int = 8) -> list[Face]:
     # 权重供给（含潜在网络下载）在调用方线程完成，不占推理超时预算
     det_model = str(model_path("face_detector"))
     lmk_model = str(model_path("face_landmarker"))
-    return _INFERENCE.call(_detect_job, rgb_arr, max_faces, det_model, lmk_model)
+    try:
+        return _INFERENCE.call(_detect_job, rgb_arr, max_faces, det_model, lmk_model)
+    except InferenceTimeout:
+        # 产品契约（issue #5）：超时 → 新代际重试一次；再超时才向上抛（当代又已毒化自愈）
+        log.warning("mediapipe 推理超时，按产品契约以新代际重试一次")
+        return _INFERENCE.call(_detect_job, rgb_arr, max_faces, det_model, lmk_model)
 
 
 # ------------------------------------------------------------------ 持久化

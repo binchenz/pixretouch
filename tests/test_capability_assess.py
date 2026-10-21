@@ -168,14 +168,17 @@ def test_verdict_rules():
 
     # 白背景高溢出但脸部曝光正常 → 不淘汰（portrait-02 实测场景）
     v, reasons, _ = A._verdict(_dims(clip_hi=0.41, face_exposure_mean=187.7))
-    assert v == "keep" and reasons == []
+    assert v == "keep" and any("可留" in r for r in reasons)
 
     # 绝对像素不足的脸（可检出但无修图价值）
     v, reasons, _ = A._verdict(_dims(max_face_side=28))
     assert v == "reject" and any("分辨率不足" in r for r in reasons)
 
     v, reasons, score = A._verdict(_dims())
-    assert v == "keep" and reasons == [] and 0.0 < score <= 1.0
+    assert v == "keep" and 0.0 < score <= 1.0
+    # 票面口径「每张含取舍结论与可读理由」：keep 也有正向可读理由
+    assert reasons and all(isinstance(r, str) and r for r in reasons)
+    assert "清晰度" in reasons[0]
 
 
 # ------------------------------------------------------------------ assess 落库（验收项 1）
@@ -328,14 +331,44 @@ def test_mini_album_verdicts(isolated_home):
     assert verdict_by_name["waste-blur-01.jpg"] == "reject"
     assert verdict_by_name["lowres-01.jpg"] == "reject"
     for e in rep["images"]:
+        assert e["reasons"], f"{e['verdict']} 必须给出可读理由（票面：每张含取舍结论与可读理由）"
         if e["verdict"] == "reject":
-            assert e["reasons"], "reject 必须给出可读理由"
+            assert any(k in " ".join(e["reasons"]) for k in ("闭眼", "模糊", "分辨率", "曝光", "人脸"))
     # 报告落盘在隔离 VAR_DIR 下（不碰真实 var/）
     assert Path(rep["report_path"]).exists()
     assert str(isolated_home) in rep["report_path"]
 
 
 # ------------------------------------------------------------------ 推理容器（issue #5 A 类挂起回归）
+@needs_models
+@needs_fixtures
+def test_detect_retries_once_on_inference_timeout(monkeypatch):
+    """产品契约（issue #5，任务板 task-10/11）：容器超时 → 新代际自动重试一次；
+    二次仍超时才上抛；重试恰好一次不多试。"""
+    calls = {"n": 0}
+
+    def flaky(fn, *args):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise F.InferenceTimeout("simulated")
+        return ["SENTINEL"]
+
+    monkeypatch.setattr(F._INFERENCE, "call", flaky)
+    assert F.detect(FIXTURES / "portrait-01-frontal-clear.jpg") == ["SENTINEL"]
+    assert calls["n"] == 2
+
+    calls["n"] = 0
+
+    def always_timeout(fn, *args):
+        calls["n"] += 1
+        raise F.InferenceTimeout("simulated")
+
+    monkeypatch.setattr(F._INFERENCE, "call", always_timeout)
+    with pytest.raises(F.InferenceTimeout):
+        F.detect(FIXTURES / "portrait-01-frontal-clear.jpg")
+    assert calls["n"] == 2, "重试恰好一次，不多试"
+
+
 def test_inference_container_timeout_recycles_generation(monkeypatch):
     """容器自愈（无需模型，顺序无关）：作业超时 → 结构化 RuntimeError + 当代毒化；
     下次调用重建新代（计数器 +1）并正常返回。"""

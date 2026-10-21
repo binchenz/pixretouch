@@ -229,6 +229,15 @@ def _verdict(a: dict[str, Any]) -> tuple[str, list[str], float]:
         score = 0.65 * sharp_score + 0.35 * expo_score
     if verdict == "reject":
         score *= 0.5
+
+    # 票面口径「每张含取舍结论与可读理由」：keep 也给正向理由（供人审阅选片报告）
+    if verdict == "keep" and not reasons:
+        parts = [f"清晰度 {sharp:.0f}（≥{SHARP_REVIEW:.0f}）", f"{expo_scope}曝光正常（均值 {mean:.0f}）"]
+        if a.get("face_detection") and count:
+            parts.append("双眼睁开（EAR 高于阈值）")
+            if side:
+                parts.append(f"最大脸短边 {side:.0f}px 满足修图要求")
+        reasons.append("可留：" + "；".join(parts))
     return verdict, reasons, score
 
 
