@@ -390,7 +390,8 @@ def apply_preset(image_id: int, suit: int | str, cluster_id: int | None = None) 
 
     Returns:
         成功 {status:"ok", suit, suit_id, steps, cache_hits, record_ids,
-        output_sha256, output_path, routing, mask_paths}；
+        output_sha256, output_path, routing, mask_paths}；图级应用零人脸时
+        另有 person_skipped 审计字段（person 域跳过，image 域照常执行）；
         失败 {status:"error", error}（事务保证零记录残留）。
     """
     return preset_cap.apply_preset_op(image_id, suit, cluster_id=cluster_id)

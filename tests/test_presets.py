@@ -271,3 +271,50 @@ def test_single_cluster_override(isolated_home):
     rows = conn.execute("SELECT cluster_id FROM records WHERE image_id=? AND id>1 ORDER BY id",
                         (img,)).fetchall()
     assert all(x["cluster_id"] == cid for x in rows)
+
+
+# ------------------------------------------------------------------ 无人脸图两分法（dev-a 语义裁决）
+@needs_models
+def test_person_steps_skipped_on_faceless_image(isolated_home):
+    """图级方案套零人脸图（合成风景）：person 域跳过 + person_skipped 审计字段，
+    image 域照常执行（套系 =「可应用的都应用」，不整单失败）。"""
+    import numpy as np
+    from PIL import Image
+
+    rng = np.random.default_rng(11)
+    yy, xx = np.mgrid[0:480, 0:640]
+    arr = np.dstack([
+        (xx / 640 * 200).astype(np.uint8),
+        (yy / 480 * 160).astype(np.uint8),
+        rng.integers(60, 90, (480, 640)).astype(np.uint8),
+    ])
+    p = isolated_home / "landscape.jpg"
+    Image.fromarray(arr).save(p, quality=92)
+    conn, ing = _ingest(p)
+    img = ing["image_id"]
+
+    r = PE.apply_preset_op(img, "natural")
+    assert r["status"] == "ok", r
+    assert r["steps"] == 1, "natural=2 person 段+1 image 段：零人脸只剩 image 段"
+    assert "未检出人脸" in r.get("person_skipped", ""), r.get("person_skipped")
+    assert _caps(conn, img) == ["base", "color_grade"]
+    assert r["mask_paths"] == {}
+
+
+@needs_models
+@needs_fixtures
+def test_cluster_override_addressing_error(isolated_home):
+    """显式 cluster_id 寻址到本图无脸的聚类 → 响亮失败（寻址错误不静默跳过），零残留。"""
+    conn, ing1 = _ingest(FIXTURES / "portrait-01-frontal-clear.jpg")
+    p1 = ing1["image_id"]
+    assert A.assess_image_op(p1)["status"] == "ok"
+    assert C.cluster_faces_op([p1])["status"] == "ok"
+    cid = C.list_clusters_op()["clusters"][0]["id"]
+
+    _c2, ing2 = _ingest(FIXTURES / "group-01-three-frontal.jpg")
+    g = ing2["image_id"]
+    assert A.assess_image_op(g)["status"] == "ok"   # group 有脸，但均不属于 cid
+
+    r = PE.apply_preset_op(g, "natural", cluster_id=cid)
+    assert r["status"] == "error" and "ValueError" in r["error"]
+    assert _caps(conn, g) == ["base"], "寻址失败必须零痕迹（事务性）"

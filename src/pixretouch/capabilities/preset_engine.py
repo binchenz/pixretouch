@@ -26,6 +26,15 @@ mask_sha/缓存键与直接调用单能力时一致）。
 straight 基准：零步骤配方 → 零渲染零记录，输出哈希恒等于输入当前态
 （工单 11 验收锚点：方案引擎自身不引入任何画质损失）。
 
+无人脸图的两分法（dev-a 语义裁决 2026-10-21）：
+- 图级应用（cluster_id=None）零人脸 → person 域整体跳过 + image 域照常执行 +
+  返回 person_skipped 审计字段。套系语义 =「可应用的都应用」：natural 的
+  轻暖调对风景照依然成立；真实相册必含风景/静物，整单失败是坏语义。
+- 显式 cluster_id 寻址而该聚类在本图无脸 → 维持结构化报错（ValueError）：
+  单聚类覆盖是「特判这个人」的显式意图，静默跳过会掩盖寻址错误。
+- 单能力直调（smooth_skin 等）无脸仍报错「人像能力无目标」——点名磨皮而
+  无脸可磨，报错是诚实语义；「部分适用」只属于套系。
+
 MCP stdio 纪律：不 print；日志 logging→stderr。
 """
 from __future__ import annotations
@@ -42,6 +51,7 @@ from .. import data, presets
 from ..engine import EngineContext, get_context, get_session, png_sha256
 from . import CAPABILITIES, load_all
 from . import face_enhance as fe_infra
+from . import faces as faces_infra
 from . import skin as skin_infra
 
 log = logging.getLogger("pixretouch.capabilities.preset_engine")
@@ -121,8 +131,12 @@ def _prepare_step(capability: str, params: dict, cache: data.ContentCache) -> tu
 
 
 def build_plan(conn: sqlite3.Connection, cache: data.ContentCache, image_id: int,
-               suit: dict[str, Any], cluster_id: int | None) -> list[_Step]:
-    """配方 → 确定性执行计划（person 段按聚类路由展开 → image 段）。"""
+               suit: dict[str, Any], cluster_id: int | None) -> tuple[list[_Step], str | None]:
+    """配方 → 确定性执行计划（person 段按聚类路由展开 → image 段）。
+
+    返回 (plan, person_skipped)；person_skipped 非 None = 图级应用零人脸，
+    person 域已按两分法跳过（见模块 docstring）。
+    """
     import cv2
     import numpy as np
 
@@ -132,7 +146,22 @@ def build_plan(conn: sqlite3.Connection, cache: data.ContentCache, image_id: int
 
     cur = data.get_current(conn, image_id)
     plan: list[_Step] = []
+    person_skipped: str | None = None
+    rows_all: list[dict] = []
     if person_steps:
+        if cluster_id is not None:
+            # 显式寻址：无脸/聚类无交集 = 寻址错误，响亮失败（target_faces 抛 ValueError）
+            rows_all = skin_infra.target_faces(conn, image_id, cluster_id)
+        else:
+            # 图级语义：零人脸 → person 域跳过 + 审计（套系 =「可应用的都应用」）
+            rows_all = faces_infra.load_faces(conn, image_id)
+            if not rows_all:
+                detected = faces_infra.detect(Path(cur["output_path"]))
+                faces_infra.persist_faces(conn, image_id, detected)
+                rows_all = faces_infra.load_faces(conn, image_id)
+            if not rows_all:
+                person_skipped = "未检出人脸——person 域步骤跳过（image 域照常执行）"
+    if person_steps and person_skipped is None:
         img = cv2.imread(str(cur["output_path"]), cv2.IMREAD_COLOR)
         if img is None:
             from PIL import Image
@@ -140,7 +169,6 @@ def build_plan(conn: sqlite3.Connection, cache: data.ContentCache, image_id: int
                                cv2.COLOR_RGB2BGR)
         size = (img.shape[1], img.shape[0])
 
-        rows_all = skin_infra.target_faces(conn, image_id, cluster_id)
         # 分组：指定 cluster_id → 单组；否则按 cluster_id 分组（升序，未聚类最后）
         groups: list[tuple[int | None, list[dict]]] = []
         if cluster_id is not None:
@@ -170,7 +198,7 @@ def build_plan(conn: sqlite3.Connection, cache: data.ContentCache, image_id: int
             plan.append(_Step(capability=st["capability"], params=params,
                               cluster_id=None, mask_sha=None, mask_img=None,
                               payload=extra, routed_suit=suit["name"]))
-    return plan
+    return plan, person_skipped
 
 
 # ------------------------------------------------------------------ 事务化执行
@@ -256,7 +284,7 @@ def apply_preset_op(image_id: int, suit: int | str, cluster_id: int | None = Non
         load_all()   # 全量能力注册表（渲染接缝按能力名派发，幂等）
         presets.ensure_seeds(conn)
         suit_row = presets.resolve_suit(conn, suit)
-        plan = build_plan(conn, cache, int(image_id), suit_row, cluster_id)
+        plan, person_skipped = build_plan(conn, cache, int(image_id), suit_row, cluster_id)
         result = run_plan(conn, cache, int(image_id), plan)
 
         # mask 双登记（成功路径）：与单能力 op 同规则 cache.put("mask:"+sha)
@@ -270,7 +298,7 @@ def apply_preset_op(image_id: int, suit: int | str, cluster_id: int | None = Non
                 mask_paths[st.mask_sha] = str(mpath)
                 mask_tmps.append(tmp)
 
-        return {
+        out = {
             "status": "ok",
             "suit": f"{suit_row['name']}@v{suit_row['version']}",
             "suit_id": suit_row["id"],
@@ -279,6 +307,9 @@ def apply_preset_op(image_id: int, suit: int | str, cluster_id: int | None = Non
             "mask_paths": mask_paths,
             **result,
         }
+        if person_skipped is not None:
+            out["person_skipped"] = person_skipped   # 审计：图级零人脸，person 域跳过
+        return out
     except Exception as e:  # noqa: BLE001  结构化错误返回；事务性保证零记录残留
         log.exception("apply_preset(image_id=%s, suit=%s) 失败", image_id, suit)
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
